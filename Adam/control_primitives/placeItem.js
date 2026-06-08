@@ -17,6 +17,17 @@ async function placeItem(bot, name, position) {
         return;
     }
     const item_count = item.count;
+    const targetBlock = bot.blockAt(position);
+    if (targetBlock?.name !== "air") {
+        bot.chat(`Cannot place ${name} at ${position}: target block is ${targetBlock?.name}`);
+        _placeItemFailCount++;
+        if (_placeItemFailCount > 10) {
+            throw new Error(
+                `placeItem failed too many times. Target position for ${name} is occupied.`
+            );
+        }
+        return;
+    }
     // find a reference block
     const faceVectors = [
         new Vec3(0, 1, 0),
@@ -52,16 +63,28 @@ async function placeItem(bot, name, position) {
 
     // You must use try catch to placeBlock
     try {
-        // You must first go to the block position you want to place
-        await bot.pathfinder.goto(new GoalPlaceBlock(position, bot.world, {}));
+        const eyeDistance = bot.entity.position.distanceTo(position.offset(0.5, 0.5, 0.5));
+        if (eyeDistance > 4.5) {
+            await bot.pathfinder.goto(new GoalPlaceBlock(position, bot.world, {}));
+        }
         // You must equip the item right before calling placeBlock
         await bot.equip(item, "hand");
         await bot.placeBlock(referenceBlock, faceVector);
         bot.chat(`Placed ${name}`);
         bot.save(`${name}_placed`);
     } catch (err) {
-        const item = bot.inventory.findInventoryItem(itemByName.id);
-        if (item?.count === item_count) {
+        await bot.waitForTicks(2);
+        const currentTargetBlock = bot.blockAt(position);
+        const remainingItem = bot.inventory.findInventoryItem(itemByName.id);
+        const placedSuccessfully =
+            currentTargetBlock?.name === name ||
+            (remainingItem ? remainingItem.count < item_count : true);
+        if (placedSuccessfully) {
+            bot.chat(`Placed ${name}`);
+            bot.save(`${name}_placed`);
+            return;
+        }
+        if (remainingItem?.count === item_count) {
             bot.chat(
                 `Error placing ${name}: ${err.message}, please find another position to place`
             );
@@ -71,9 +94,6 @@ async function placeItem(bot, name, position) {
                     `placeItem failed too many times, please find another position to place.`
                 );
             }
-        } else {
-            bot.chat(`Placed ${name}`);
-            bot.save(`${name}_placed`);
         }
     }
 }

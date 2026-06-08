@@ -18,10 +18,108 @@ const {plugin: tool} = require("mineflayer-tool");
 const {pathfinder, Movements, goals} = require('mineflayer-pathfinder')
 const {GoalXZ, GoalBlock} = goals
 
-//Visual module
-const mineflayerViewer = require('prismarine-viewer').mineflayer
-
 let bot = null;
+let viewerStatus = "disabled";
+
+function isAirLike(block) {
+    return !block || block.name === "air" || block.name === "cave_air" || block.name === "void_air";
+}
+
+function isStandableGround(block) {
+    return block && block.name !== "air" && block.boundingBox === "block";
+}
+
+function hasPlaceableAdjacentSpot(botInstance, standPos) {
+    const candidates = [
+        {x: 1, z: 0},
+        {x: -1, z: 0},
+        {x: 0, z: 1},
+        {x: 0, z: -1},
+        {x: 1, z: 1},
+        {x: -1, z: 1},
+        {x: 1, z: -1},
+        {x: -1, z: -1},
+    ];
+    for (const offset of candidates) {
+        const ground = botInstance.blockAt(standPos.offset(offset.x, -1, offset.z));
+        const place = botInstance.blockAt(standPos.offset(offset.x, 0, offset.z));
+        const head = botInstance.blockAt(standPos.offset(offset.x, 1, offset.z));
+        if (isStandableGround(ground) && isAirLike(place) && isAirLike(head)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function findSafeTrackedPosition(botInstance, playerEntity, searchRadius = 6) {
+    const base = playerEntity.position.floored();
+    const offsets = [];
+    for (let radius = 2; radius <= searchRadius; radius++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+            for (let dz = -radius; dz <= radius; dz++) {
+                if (Math.max(Math.abs(dx), Math.abs(dz)) !== radius) continue;
+                offsets.push({dx, dz});
+            }
+        }
+    }
+
+    for (const {dx, dz} of offsets) {
+        for (const dy of [0, -1, 1, -2, 2]) {
+            const feetPos = base.offset(dx, dy, dz);
+            const ground = botInstance.blockAt(feetPos.offset(0, -1, 0));
+            const feet = botInstance.blockAt(feetPos);
+            const head = botInstance.blockAt(feetPos.offset(0, 1, 0));
+            if (!isStandableGround(ground)) continue;
+            if (!isAirLike(feet) || !isAirLike(head)) continue;
+            if (!hasPlaceableAdjacentSpot(botInstance, feetPos)) continue;
+            return {
+                x: feetPos.x + 0.5,
+                y: feetPos.y,
+                z: feetPos.z + 0.5,
+            };
+        }
+    }
+
+    return null;
+}
+
+function getNearestHumanPlayerEntity(botInstance) {
+    const candidates = Object.values(botInstance.players || {})
+        .map((player) => player && player.entity ? player.entity : null)
+        .filter((entity) => entity && entity.username && entity.username !== botInstance.username);
+
+    if (!candidates.length) {
+        return null;
+    }
+
+    return candidates.sort((a, b) => {
+        return a.position.distanceTo(botInstance.entity.position) - b.position.distanceTo(botInstance.entity.position);
+    })[0];
+}
+
+async function runCommand(botInstance, command, extraTicks = 1) {
+    botInstance.chat(command);
+    await botInstance.waitForTicks(botInstance.waitTicks * extraTicks);
+}
+
+function getTrackedPlayerSpawnPosition(playerEntity) {
+    const baseX = playerEntity.position.x;
+    const baseY = playerEntity.position.y;
+    const baseZ = playerEntity.position.z;
+    const offsetDistance = 4;
+    const sideOffset = 1.5;
+    const yaw = playerEntity.yaw || 0;
+    const behindX = -Math.sin(yaw) * offsetDistance;
+    const behindZ = Math.cos(yaw) * offsetDistance;
+    const sideX = Math.cos(yaw) * sideOffset;
+    const sideZ = Math.sin(yaw) * sideOffset;
+
+    return {
+        x: (baseX + behindX + sideX).toFixed(2),
+        y: Math.floor(baseY),
+        z: (baseZ + behindZ + sideZ).toFixed(2),
+    };
+}
 
 const app = express();
 
@@ -31,15 +129,22 @@ app.use(bodyParser.urlencoded({limit: "50mb", extended: false}));
 app.post("/start", (req, res) => {
     if (bot) onDisconnect("Restarting bot");
     bot = null;
+    viewerStatus = "disabled";
     console.log(req.body);
+    console.log(`Connecting mineflayer bot to localhost:${req.body.port} as bot_${PORT}`);
     bot = mineflayer.createBot({
         host: "localhost", // minecraft server ip
         port: req.body.port, // minecraft server port
         username: `bot_${PORT}`,
+        auth: "offline",
+        version: "1.19",
         disableChatSigning: true,
         checkTimeoutInterval: 60 * 60 * 1000,
     });
     bot.once("error", onConnectionFailed);
+    bot.once("login", () => console.log(`Mineflayer bot logged in with version ${bot.version}`));
+    bot.once("spawn", () => console.log("Mineflayer bot spawned"));
+    bot.once("end", (reason) => console.log(`Mineflayer bot ended: ${reason}`));
 
     // Event subscriptions
     bot.waitTicks = req.body.waitTicks;
@@ -48,7 +153,10 @@ app.post("/start", (req, res) => {
     bot.stuckPosList = [];
     bot.iron_pickaxe = false;
 
-    bot.on("kicked", onDisconnect);
+    bot.on("kicked", (reason, loggedIn) => {
+        console.log(`Mineflayer bot kicked. loggedIn=${loggedIn} reason=${reason}`);
+        onDisconnect(reason);
+    });
 
     // mounting will cause physicsTick to stop
     bot.on("mount", () => {
@@ -57,21 +165,27 @@ app.post("/start", (req, res) => {
 
     bot.once("spawn", async () => {
         if (VISUAL_SERVER_PORT !== "-1") {
-            console.log("Initializing Mineflayer viewer...");
-            mineflayerViewer(bot, {firstPerson: true, port: Number(VISUAL_SERVER_PORT)});
-            console.log("Mineflayer viewer initialized.");
+            try {
+                console.log("Initializing Mineflayer viewer...");
+                const mineflayerViewer = require('prismarine-viewer').mineflayer
+                mineflayerViewer(bot, {firstPerson: false, port: Number(VISUAL_SERVER_PORT)});
+                console.log("Mineflayer viewer initialized.");
+                viewerStatus = `http://127.0.0.1:${VISUAL_SERVER_PORT}`;
+            } catch (error) {
+                console.log(`Mineflayer viewer disabled: ${error.message}`);
+                viewerStatus = `disabled: ${error.message}`;
+            }
         }
         bot.removeListener("error", onConnectionFailed);
         let itemTicks = 1;
         if (req.body.reset === "hard") {
-            bot.chat("/clear @s");
-            bot.chat("/kill @s");
+            await runCommand(bot, "/clear @s");
             const inventory = req.body.inventory ? req.body.inventory : {};
             const equipment = req.body.equipment
                 ? req.body.equipment
                 : [null, null, null, null, null, null];
             for (let key in inventory) {
-                bot.chat(`/give @s minecraft:${key} ${inventory[key]}`);
+                await runCommand(bot, `/give @s minecraft:${key} ${inventory[key]}`);
                 itemTicks += 1;
             }
             const equipmentNames = [
@@ -85,7 +199,8 @@ app.post("/start", (req, res) => {
             for (let i = 0; i < 6; i++) {
                 if (i === 4) continue;
                 if (equipment[i]) {
-                    bot.chat(
+                    await runCommand(
+                        bot,
                         `/item replace entity @s ${equipmentNames[i]} with minecraft:${equipment[i]}`
                     );
                     itemTicks += 1;
@@ -93,8 +208,31 @@ app.post("/start", (req, res) => {
             }
         }
 
-        if (req.body.position) {
-            bot.chat(
+        if (req.body.trackPlayer) {
+            const playerEntity = getNearestHumanPlayerEntity(bot);
+            if (playerEntity) {
+                const safeTrackedPosition =
+                    findSafeTrackedPosition(bot, playerEntity) ||
+                    getTrackedPlayerSpawnPosition(playerEntity);
+                const spawnPosition = {
+                    x: Number(safeTrackedPosition.x).toFixed(2),
+                    y: Math.floor(safeTrackedPosition.y),
+                    z: Number(safeTrackedPosition.z).toFixed(2),
+                };
+                await runCommand(
+                    bot,
+                    `/tp @s ${spawnPosition.x} ${spawnPosition.y} ${spawnPosition.z}`
+                );
+                await runCommand(
+                    bot,
+                    `Tracking player ${playerEntity.username} from ${spawnPosition.x} ${spawnPosition.y} ${spawnPosition.z}`
+                );
+            } else {
+                await runCommand(bot, "No human player entity found to track. Staying at current spawn.");
+            }
+        } else if (req.body.position) {
+            await runCommand(
+                bot,
                 `/tp @s ${req.body.position.x} ${req.body.position.y} ${req.body.position.z}`
             );
         }
@@ -133,16 +271,17 @@ app.post("/start", (req, res) => {
         skills.inject(bot);
 
         if (req.body.spread) {
-            bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
-            await bot.waitForTicks(bot.waitTicks);
+            await runCommand(bot, `/spreadplayers ~ ~ 0 300 under 80 false @s`);
         }
 
         await bot.waitForTicks(bot.waitTicks * itemTicks);
-        res.json(bot.observe());
+        const initialObservation = bot.observe();
+        initialObservation[1]["viewerStatus"] = viewerStatus;
+        res.json(initialObservation);
 
         initCounter(bot);
-        bot.chat("/gamerule keepInventory true");
-        bot.chat("/gamerule doDaylightCycle false");
+        await runCommand(bot, "/gamerule keepInventory true");
+        await runCommand(bot, "/gamerule doDaylightCycle false");
     });
 
     function onConnectionFailed(e) {
@@ -247,19 +386,45 @@ app.post("/step", async (req, res) => {
     // Retrieve array form post bod
     const code = req.body.code;
     const programs = req.body.programs;
+    const actionMatch = code.match(/await\s+([A-Za-z0-9_]+)\s*\(\s*bot\s*\)/);
+    const actionName = actionMatch ? actionMatch[1] : "unknown";
+    console.log(`ADAM_STEP_START action=${actionName} codeChars=${code.length} programsChars=${programs.length}`);
+    bot.chat(`[ADAM_STEP_START] ${actionName}`);
+    if (actionName.startsWith("craft")) {
+        const playerEntity = getNearestHumanPlayerEntity(bot);
+        const safeTrackedPosition = playerEntity ? findSafeTrackedPosition(bot, playerEntity, 8) : null;
+        if (safeTrackedPosition) {
+            await runCommand(
+                bot,
+                `/tp @s ${safeTrackedPosition.x.toFixed(2)} ${Math.floor(safeTrackedPosition.y)} ${safeTrackedPosition.z.toFixed(2)}`
+            );
+            bot.chat(
+                `Adjusted near player to ${Math.floor(safeTrackedPosition.x)} ${Math.floor(safeTrackedPosition.y)} ${Math.floor(safeTrackedPosition.z)}`
+            );
+        }
+    }
     bot.cumulativeObs = [];
     await bot.waitForTicks(bot.waitTicks);
     const r = await evaluateCode(code, programs);
+    console.log(`ADAM_STEP_RESULT action=${actionName} result=${r === "success" ? "success" : String(r)}`);
     process.off("uncaughtException", otherError);
     if (r !== "success") {
         bot.emit("error", handleError(r));
+        if (!response_sent) {
+            response_sent = true;
+            res.status(400).json(bot.observe());
+        }
+        bot.removeListener("physicTick", onTick);
+        return;
     }
     await returnItems();
     // wait for last message
     await bot.waitForTicks(bot.waitTicks);
     if (!response_sent) {
         response_sent = true;
-        res.json(bot.observe());
+        const finalObservation = bot.observe();
+        finalObservation[1]["viewerStatus"] = viewerStatus;
+        res.json(finalObservation);
     }
     bot.removeListener("physicTick", onTick);
 

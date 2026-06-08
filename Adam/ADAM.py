@@ -42,6 +42,8 @@ class ADAM:
             load_ckpt_path: str = '',
             auto_load_ckpt: bool = False,
             parallel: bool = False,
+            reset_position: Dict[str, float] = None,
+            track_player: bool = False,
     ):
         self.env = VoyagerEnv(
             mc_port=mc_port,
@@ -54,6 +56,8 @@ class ADAM:
         self.local_llm_port = local_llm_port
         self.local_mllm_port = local_mllm_port
         self.parallel = parallel
+        self.reset_position = reset_position
+        self.track_player = track_player
         if parallel:
             self.env_vector = {game_server_port: self.env}
             for i in range(1, max([infer_sampling_num, max_try])):
@@ -98,6 +102,11 @@ class ADAM:
         if auto_load_ckpt:
             self.auto_load_state()
         openai.api_key = openai_api_key
+        if os.environ.get("OPENAI_BASE_URL"):
+            base_url = os.environ["OPENAI_BASE_URL"].strip()
+            if base_url and not base_url.endswith("/"):
+                base_url += "/"
+            openai.base_url = base_url
 
     def get_llm_answer(self, prompt):
         if self.use_local_llm_service:
@@ -110,8 +119,17 @@ class ADAM:
         for _ in range(self.max_llm_answer_num):
             try:
                 response_text = self.get_llm_answer(prompt_text)
-                extracted_response = re.search(r'{(.*?)}', response_text).group(1)
-                cause, effect = extracted_response.strip("{}").replace(" ", "").split(";")
+                self.loop_record["llm_answer_content"] = response_text
+                match = re.search(r'{([^{}]*)}', response_text, re.DOTALL)
+                if not match:
+                    raise ValueError(f"No brace-wrapped answer found in: {response_text!r}")
+                extracted_response = match.group(1).replace(" ", "").strip()
+                parts = extracted_response.split(";")
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Expected '{{cause;effect}}' format, got: {extracted_response!r}"
+                    )
+                cause, effect = parts
             except Exception as e:
                 print("\033[91mLLM inference failed:" + str(e) + '\033[0m')
                 continue
@@ -127,7 +145,6 @@ class ADAM:
                 self.loop_record["llm_answer_checks_num"] = _ + 1
                 self.loop_record["llm_answer_success"] = True
                 self.loop_record["llm_answer_record"].append([cause, effect])
-                self.loop_record["llm_answer_content"] = response_text
                 return True, cause, effect
         return False, None, None
 
@@ -196,18 +213,25 @@ class ADAM:
 
     def sample_action_once(self, env, action):
         options = {"inventory": {}, "mode": "hard"}
+        if self.reset_position:
+            options["position"] = self.reset_position
+        if self.track_player:
+            options["track_player"] = True
         for material in self.observation_item_space:
             options["inventory"] = get_inventory_number(options["inventory"], material)
-        env.reset(options=options)
+        reset_result = env.reset(options=options)
         time.sleep(1)
-        result = env.step(skill_loader(action))
+        start_item = reset_result[0][1]['inventory']
+        env.step(skill_loader(action))
         time.sleep(1)
-        start_item = result[0][1]['inventory']
         result = env.step('')
         time.sleep(1)
         end_item = result[0][1]['inventory']
         consumed_items, added_items = get_item_changes(start_item, end_item)
         if not added_items:
+            print(f"Action {action} produced no added items from the current local world state.")
+            env.close()
+            time.sleep(1)
             return False
         with lock:
             recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
@@ -233,17 +257,27 @@ class ADAM:
         else:
             for i in range(self.infer_sampling_num):
                 print(f'Sampling {i + 1} started')
-                while not self.sample_action_once(self.env, action):
-                    ...
+                if not self.sample_action_once(self.env, action):
+                    print(
+                        f"Action {action} did not produce progress from the current local setup. "
+                        f"Continuing so the visible in-game search result remains inspectable."
+                    )
+                    return False
 
     def causal_verification_once(self, env, options_orig, action, effect_item):
         try:
             print(f'Verification of action {action}, inventory: {options_orig["inventory"]}')
-            env.reset(options=options_orig)
+            if self.reset_position:
+                options_orig = copy.deepcopy(options_orig)
+                options_orig["position"] = self.reset_position
+            if self.track_player:
+                options_orig = copy.deepcopy(options_orig)
+                options_orig["track_player"] = True
+            reset_result = env.reset(options=options_orig)
             time.sleep(1)
-            result = env.step(skill_loader(action))
+            start_item = reset_result[0][1]['inventory']
+            env.step(skill_loader(action))
             time.sleep(1)
-            start_item = result[0][1]['inventory']
             result = env.step('')
             time.sleep(1)
             end_item = result[0][1]['inventory']
@@ -441,6 +475,10 @@ class ADAM:
     def controller(self):
         # initial Minecraft instance
         options = {"mode": "hard"}
+        if self.reset_position:
+            options["position"] = self.reset_position
+        if self.track_player:
+            options["track_player"] = True
         self.env.reset(options=options)
         result = self.env.step('')
         self.run_visual_API()
