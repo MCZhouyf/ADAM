@@ -20,6 +20,7 @@ const {GoalXZ, GoalBlock} = goals
 
 let bot = null;
 let viewerStatus = "disabled";
+let viewerHost = "127.0.0.1";
 
 function isAirLike(block) {
     return !block || block.name === "air" || block.name === "cave_air" || block.name === "void_air";
@@ -168,8 +169,13 @@ app.post("/start", (req, res) => {
             try {
                 console.log("Initializing Mineflayer viewer...");
                 const mineflayerViewer = require('prismarine-viewer').mineflayer
-                mineflayerViewer(bot, {firstPerson: false, port: Number(VISUAL_SERVER_PORT)});
+                mineflayerViewer(bot, {
+                    firstPerson: false,
+                    port: Number(VISUAL_SERVER_PORT),
+                    host: "0.0.0.0",
+                });
                 console.log("Mineflayer viewer initialized.");
+                viewerHost = req.hostname || "127.0.0.1";
                 viewerStatus = `http://127.0.0.1:${VISUAL_SERVER_PORT}`;
             } catch (error) {
                 console.log(`Mineflayer viewer disabled: ${error.message}`);
