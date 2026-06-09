@@ -7,7 +7,21 @@ class Inventory extends Observation {
     }
 
     observe() {
-        return listItems(this.bot);
+        const inventoryDict = listItems(this.bot);
+        try {
+            console.log(
+                `[ADAM_DEBUG][inventory.observe] raw=${JSON.stringify(
+                    getInventoryItems(this.bot).map(item => ({
+                        name: item.name,
+                        count: item.count,
+                        slot: item.slot,
+                    }))
+                )} dict=${JSON.stringify(inventoryDict)}`
+            );
+        } catch (error) {
+            console.log(`[ADAM_DEBUG][inventory.observe] failed to serialize inventory: ${error.message}`);
+        }
+        return inventoryDict;
     }
 }
 

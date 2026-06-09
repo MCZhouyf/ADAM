@@ -7,6 +7,8 @@ import psutil
 import subprocess
 import logging
 import threading
+import os
+import signal
 
 import utils as U
 
@@ -21,6 +23,7 @@ class SubprocessMonitor:
         callback_match: str = r"^(?!x)x$",  # regex that will never match
         callback: callable = None,
         finished_callback: callable = None,
+        env: dict = None,
     ):
         self.commands = commands
         start_time = time.strftime("%Y%m%d_%H%M%S")
@@ -40,6 +43,7 @@ class SubprocessMonitor:
         self.callback_match = callback_match
         self.callback = callback
         self.finished_callback = finished_callback
+        self.env = env or os.environ.copy()
         self.thread = None
 
     def _start(self):
@@ -50,6 +54,8 @@ class SubprocessMonitor:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
+            env=self.env,
+            start_new_session=True,
         )
         print(f"Subprocess {self.name} started with PID {self.process.pid}.")
         for line in iter(self.process.stdout.readline, ""):

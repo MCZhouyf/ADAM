@@ -1,6 +1,7 @@
 async function gatherWoodLog(bot) {
   const { goals } = require("mineflayer-pathfinder");
   const { GoalNear } = goals;
+  const debugChatEnabled = process.env.ADAM_DEBUG_CHAT === "1";
 
   bot.chat("Gathering wood logs started near current position");
 
@@ -13,6 +14,153 @@ async function gatherWoodLog(bot) {
     "dark_oak_log",
     "mangrove_log",
   ];
+
+  function summarizeInventory() {
+    return bot.inventory.items().map(item => ({
+      name: item.name,
+      count: item.count,
+      slot: item.slot,
+    }));
+  }
+
+  function inventoryToDict(items) {
+    const result = {};
+    for (const item of items) {
+      if (!item || !item.name || !item.count) {
+        continue;
+      }
+      result[item.name] = (result[item.name] || 0) + item.count;
+    }
+    return result;
+  }
+
+  function diffInventory(beforeItems, afterItems) {
+    const before = inventoryToDict(beforeItems);
+    const after = inventoryToDict(afterItems);
+    const added = {};
+    const removed = {};
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+
+    for (const key of keys) {
+      const beforeCount = before[key] || 0;
+      const afterCount = after[key] || 0;
+      if (afterCount > beforeCount) {
+        added[key] = afterCount - beforeCount;
+      } else if (beforeCount > afterCount) {
+        removed[key] = beforeCount - afterCount;
+      }
+    }
+
+    return { added, removed };
+  }
+
+  function summarizeBlock(block) {
+    if (!block) {
+      return null;
+    }
+    return {
+      name: block.name,
+      type: block.type,
+      stateId: block.stateId,
+      metadata: block.metadata,
+      position: {
+        x: block.position.x,
+        y: block.position.y,
+        z: block.position.z,
+      },
+      drops:
+        block.drops && Array.isArray(block.drops)
+          ? block.drops.map(drop => ({
+              id: drop.id,
+              metadata: drop.metadata,
+              count: drop.count,
+              name: drop.name || null,
+            }))
+          : [],
+      diggable: block.diggable,
+      boundingBox: block.boundingBox,
+      material: block.material || null,
+      transparent: block.transparent,
+      harvestTools: block.harvestTools || null,
+    };
+  }
+
+  function debugMessage(message) {
+    console.log(message);
+    if (debugChatEnabled) {
+      try {
+        bot.chat(message);
+      } catch (error) {
+      }
+    }
+  }
+
+  function summarizeNearbyDrops(radius = 8) {
+    return Object.values(bot.entities)
+      .filter(entity => {
+        return (
+          entity &&
+          entity.name === "item" &&
+          entity.position &&
+          entity.position.distanceTo(bot.entity.position) <= radius
+        );
+      })
+      .map(entity => ({
+        id: entity.id,
+        position: {
+          x: Number(entity.position.x.toFixed(2)),
+          y: Number(entity.position.y.toFixed(2)),
+          z: Number(entity.position.z.toFixed(2)),
+        },
+        velocity: entity.velocity
+          ? {
+              x: Number(entity.velocity.x.toFixed(2)),
+              y: Number(entity.velocity.y.toFixed(2)),
+              z: Number(entity.velocity.z.toFixed(2)),
+            }
+          : null,
+        metadata: entity.metadata || null,
+      }));
+  }
+
+  async function waitForInventoryChange(previousTotalCount, maxChecks = 8, waitTicks = 10) {
+    for (let index = 0; index < maxChecks; index += 1) {
+      await bot.waitForTicks(waitTicks);
+      const inventoryNow = summarizeInventory();
+      const totalCount = inventoryNow.reduce((sum, item) => sum + item.count, 0);
+      const nearbyDrops = summarizeNearbyDrops();
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] poll=${index + 1}/${maxChecks} inventory=${JSON.stringify(inventoryNow)} nearbyDrops=${JSON.stringify(nearbyDrops)}`
+      );
+      if (totalCount > previousTotalCount) {
+        return true;
+      }
+      if (nearbyDrops.length) {
+        const closestDrop = Object.values(bot.entities)
+          .filter(entity => entity && entity.name === "item" && entity.position)
+          .sort(
+            (a, b) =>
+              a.position.distanceTo(bot.entity.position) -
+              b.position.distanceTo(bot.entity.position)
+          )[0];
+        if (closestDrop) {
+          try {
+            await bot.pathfinder.goto(
+              new GoalNear(
+                Math.floor(closestDrop.position.x),
+                Math.floor(closestDrop.position.y),
+                Math.floor(closestDrop.position.z),
+                1
+              )
+            );
+          } catch (error) {
+            bot.chat(`Pickup path failed near drop ${closestDrop.id}`);
+          }
+        }
+      }
+    }
+    return false;
+  }
 
   function getNearbyLogBlocks(radius, count = 24) {
     return bot.findBlocks({
@@ -61,7 +209,6 @@ async function gatherWoodLog(bot) {
       }
     }
   }
-
   if (!targets.length) {
     bot.chat("No reachable wood log found after visible search. Move the player/bot near a tree or set ADAM_BOT_POSITION near trees.");
     return;
@@ -70,7 +217,8 @@ async function gatherWoodLog(bot) {
   const mineTargets = targets.slice(0, 4);
   bot.chat(`Mining up to ${mineTargets.length} nearby wood logs.`);
 
-  let collectedCount = 0;
+  let minedTargetCount = 0;
+  let inventoryProgressCount = 0;
   for (const target of mineTargets) {
     const liveTarget = bot.blockAt(target.position);
     if (!liveTarget || !logNames.includes(liveTarget.name)) {
@@ -78,22 +226,104 @@ async function gatherWoodLog(bot) {
     }
 
     try {
-      await bot.collectBlock.collect(liveTarget, {
-        ignoreNoPath: true,
-        count: 1,
-      });
-      collectedCount += 1;
-      bot.chat(`Collected ${liveTarget.name} at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`);
+      const inventoryBefore = summarizeInventory();
+      const inventoryBeforeTotal = inventoryBefore.reduce((sum, item) => sum + item.count, 0);
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] before_target=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z} inventory=${JSON.stringify(inventoryBefore)}`
+      );
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] target_block=${JSON.stringify(summarizeBlock(liveTarget))}`
+      );
+      const below = bot.blockAt(liveTarget.position.offset(0, -1, 0));
+      const above = bot.blockAt(liveTarget.position.offset(0, 1, 0));
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] target_neighbors below=${below ? below.name : "null"} above=${above ? above.name : "null"}`
+      );
+
+      await bot.pathfinder.goto(
+        new GoalNear(
+          liveTarget.position.x,
+          liveTarget.position.y,
+          liveTarget.position.z,
+          1
+        )
+      );
+      await bot.lookAt(liveTarget.position.offset(0.5, 0.5, 0.5), true);
+      await bot.dig(liveTarget);
+      minedTargetCount += 1;
+      bot.chat(
+        `Mined target block ${liveTarget.name} at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`
+      );
+      await bot.waitForTicks(bot.waitTicks * 2);
+
+      const nearbyDropsAfterDig = summarizeNearbyDrops();
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] drops_after_dig=${JSON.stringify(nearbyDropsAfterDig)}`
+      );
+
+      if (nearbyDropsAfterDig.length) {
+        for (const drop of nearbyDropsAfterDig) {
+          try {
+            await bot.pathfinder.goto(
+              new GoalNear(
+                Math.floor(drop.position.x),
+                Math.floor(drop.position.y),
+                Math.floor(drop.position.z),
+                1
+              )
+            );
+            await bot.waitForTicks(bot.waitTicks);
+          } catch (error) {
+            bot.chat(`Skipping unreachable drop ${drop.id}`);
+          }
+        }
+      }
+
+      const gotInventoryProgress = await waitForInventoryChange(inventoryBeforeTotal, 12, 10);
+      const inventoryAfter = summarizeInventory();
+      const inventoryDelta = diffInventory(inventoryBefore, inventoryAfter);
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] inventory_delta target=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z} added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
+      );
+      if (gotInventoryProgress) {
+        inventoryProgressCount += 1;
+        bot.chat(
+          `Inventory changed after mining ${liveTarget.name}: added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
+        );
+      } else {
+        debugMessage(
+          `[ADAM_DEBUG][gatherWoodLog] no_inventory_progress target=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z}`
+        );
+        bot.chat(
+          `No inventory progress after mining ${liveTarget.name} at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`
+        );
+      }
     } catch (error) {
-      bot.chat(`Skipping unreachable log at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`);
+      bot.chat(`Skipping unreachable log at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}: ${error.message}`);
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] target_error=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z} error=${error.stack || error.message}`
+      );
     }
   }
 
-  if (!collectedCount) {
+  if (!minedTargetCount) {
     bot.chat("Found nearby logs, but none were reachable for mining.");
     return;
   }
 
+  try {
+    const rawInventory = bot.inventory.items().map(item => ({
+      name: item.name,
+      count: item.count,
+      slot: item.slot,
+    }));
+    bot.chat(`[ADAM_DEBUG] Inventory after gatherWoodLog: ${JSON.stringify(rawInventory)}`);
+    console.log(`[ADAM_DEBUG][gatherWoodLog] inventory_after=${JSON.stringify(rawInventory)}`);
+  } catch (error) {
+    bot.chat(`[ADAM_DEBUG] Failed to read inventory after gatherWoodLog: ${error.message}`);
+    console.log(`[ADAM_DEBUG][gatherWoodLog] inventory_after_error=${error.message}`);
+  }
+
   bot.save("wood_log_gathered");
-  bot.chat(`Gathered ${collectedCount} nearby wood logs.`);
+  bot.chat(`Mined ${minedTargetCount} target log blocks. Inventory progress observed on ${inventoryProgressCount}.`);
 }

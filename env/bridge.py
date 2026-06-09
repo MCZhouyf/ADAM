@@ -85,10 +85,11 @@ class VoyagerEnv(gym.Env):
             print("Mineflayer process has exited, restarting")
             self.mineflayer.run()
             if not self.mineflayer.is_running:
+                retry += 1
                 if retry > 3:
                     raise RuntimeError("Mineflayer process failed to start")
-                else:
-                    continue
+                time.sleep(1)
+                continue
             print(self.mineflayer.ready_line)
             res = requests.post(
                 f"{self.server}/start",

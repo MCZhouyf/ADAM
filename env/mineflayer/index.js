@@ -171,6 +171,7 @@ app.post("/start", (req, res) => {
                 const mineflayerViewer = require('prismarine-viewer').mineflayer
                 mineflayerViewer(bot, {
                     firstPerson: false,
+                    viewDistance: 3,
                     port: Number(VISUAL_SERVER_PORT),
                     host: "0.0.0.0",
                 });

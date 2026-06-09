@@ -19,6 +19,12 @@ from Adam.MLLM_API import get_image_description
 lock = threading.Lock()
 
 
+def has_expected_action_progress(action, added_items):
+    if action == "gatherWoodLog":
+        return any(str(item).endswith("_log") for item in added_items)
+    return bool(added_items)
+
+
 class ADAM:
     def __init__(
             self,
@@ -97,6 +103,8 @@ class ADAM:
         self.goal = ([], [])
         self.goal_item_letters = translate_item_name_list_to_letter(self.goal[0])
         self.memory = []
+        self.openai_api_key = openai_api_key.strip()
+        self.openai_base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
         if load_ckpt_path:
             self.load_state(load_ckpt_path)
         if auto_load_ckpt:
@@ -112,7 +120,12 @@ class ADAM:
         if self.use_local_llm_service:
             response_text = get_local_response(prompt, self.local_llm_port)
         else:
-            response_text = get_response(prompt, self.llm_model_type)
+            response_text = get_response(
+                prompt,
+                self.llm_model_type,
+                api_key=self.openai_api_key,
+                base_url=self.openai_base_url,
+            )
         return response_text
 
     def check_llm_answer(self, prompt_text):
@@ -211,6 +224,27 @@ class ADAM:
         return '\n'.join([f"Action: {key}; Cause: {value[0]}; Effect {value[1]}" for key, value in
                           self.learned_causal_subgraph.items()])
 
+    def wait_for_inventory_progress(self, env, start_item, max_checks=3, wait_seconds=1):
+        last_result = None
+        last_end_item = start_item
+        last_consumed_items = []
+        last_added_items = []
+
+        for check_index in range(max_checks):
+            time.sleep(wait_seconds)
+            last_result = env.step('')
+            time.sleep(wait_seconds)
+            last_end_item = last_result[0][1]['inventory']
+            last_consumed_items, last_added_items = get_item_changes(start_item, last_end_item)
+            print(
+                f"Inventory check {check_index + 1}/{max_checks}: "
+                f"start_item={start_item}, end_item={last_end_item}"
+            )
+            if last_added_items:
+                return last_result, last_end_item, last_consumed_items, last_added_items
+
+        return last_result, last_end_item, last_consumed_items, last_added_items
+
     def sample_action_once(self, env, action):
         options = {"inventory": {}, "mode": "hard"}
         if self.reset_position:
@@ -222,17 +256,29 @@ class ADAM:
         reset_result = env.reset(options=options)
         time.sleep(1)
         start_item = reset_result[0][1]['inventory']
+        print(f"Action {action} start_item={start_item}")
         env.step(skill_loader(action))
-        time.sleep(1)
-        result = env.step('')
-        time.sleep(1)
-        end_item = result[0][1]['inventory']
-        consumed_items, added_items = get_item_changes(start_item, end_item)
+        _, end_item, consumed_items, added_items = self.wait_for_inventory_progress(env, start_item)
         if not added_items:
-            print(f"Action {action} produced no added items from the current local world state.")
+            print(
+                f"Action {action} produced no added items from the current local world state. "
+                f"Final start_item={start_item}, end_item={end_item}"
+            )
             env.close()
             time.sleep(1)
             return False
+        if not has_expected_action_progress(action, added_items):
+            print(
+                f"Action {action} added items {added_items}, but none match the expected progress type. "
+                f"Final start_item={start_item}, end_item={end_item}"
+            )
+            env.close()
+            time.sleep(1)
+            return False
+        print(
+            f"Action {action} inventory progress detected: "
+            f"start_item={start_item}, end_item={end_item}, added_items={added_items}"
+        )
         with lock:
             recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
             self.update_material_dict(end_item)
@@ -531,6 +577,10 @@ class ADAM:
         python_executable = sys.executable
         script_path = os.path.join(os.getcwd(), 'Adam', "visual_API.py")
         commands = [python_executable, script_path]
+        visual_env = os.environ.copy()
+        visual_env["PYTHONUNBUFFERED"] = "1"
+        visual_env["ADAM_VISUAL_API_URL"] = f"http://127.0.0.1:{self.env.visual_server_port}"
+        visual_env["ADAM_VISUAL_IMAGE_DIR"] = os.path.join("Adam", "game_image")
         monitor = SubprocessMonitor(
             commands=commands,
             name="VisualAPIMonitor",
@@ -538,6 +588,7 @@ class ADAM:
             log_path="logs",
             callback_match=r"Error",
             callback=lambda: print("Error detected in subprocess!"),
-            finished_callback=lambda: print("Subprocess has finished.")
+            finished_callback=lambda: print("Subprocess has finished."),
+            env=visual_env,
         )
         monitor.run()
