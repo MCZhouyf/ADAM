@@ -25,6 +25,43 @@ def has_expected_action_progress(action, added_items):
     return bool(added_items)
 
 
+def get_latest_save_marker(step_result):
+    if not step_result:
+        return None
+    events = step_result
+    if not isinstance(events, list):
+        return None
+    latest = None
+    for event in events:
+        if not isinstance(event, (list, tuple)) or len(event) != 2:
+            continue
+        event_name, payload = event
+        if not isinstance(payload, dict):
+            continue
+        direct_marker = payload.get("saveMarker")
+        if direct_marker:
+            latest = direct_marker
+        marker = payload.get("onSave")
+        if marker:
+            latest = marker
+    return latest
+
+
+def get_latest_inventory(step_result, default=None):
+    if default is None:
+        default = {}
+    if not isinstance(step_result, list):
+        return default
+    latest = default
+    for event in step_result:
+        if not isinstance(event, (list, tuple)) or len(event) != 2:
+            continue
+        _, payload = event
+        if isinstance(payload, dict) and isinstance(payload.get("inventory"), dict):
+            latest = payload["inventory"]
+    return latest
+
+
 class ADAM:
     def __init__(
             self,
@@ -229,21 +266,35 @@ class ADAM:
         last_end_item = start_item
         last_consumed_items = []
         last_added_items = []
+        last_save_marker = None
 
         for check_index in range(max_checks):
             time.sleep(wait_seconds)
             last_result = env.step('')
             time.sleep(wait_seconds)
-            last_end_item = last_result[0][1]['inventory']
+            last_end_item = get_latest_inventory(last_result, last_end_item)
             last_consumed_items, last_added_items = get_item_changes(start_item, last_end_item)
+            last_save_marker = get_latest_save_marker(last_result)
             print(
                 f"Inventory check {check_index + 1}/{max_checks}: "
-                f"start_item={start_item}, end_item={last_end_item}"
+                f"start_item={start_item}, end_item={last_end_item}, save_marker={last_save_marker}"
             )
-            if last_added_items:
-                return last_result, last_end_item, last_consumed_items, last_added_items
+            if last_added_items or last_save_marker:
+                return (
+                    last_result,
+                    last_end_item,
+                    last_consumed_items,
+                    last_added_items,
+                    last_save_marker,
+                )
 
-        return last_result, last_end_item, last_consumed_items, last_added_items
+        return (
+            last_result,
+            last_end_item,
+            last_consumed_items,
+            last_added_items,
+            last_save_marker,
+        )
 
     def sample_action_once(self, env, action):
         options = {"inventory": {}, "mode": "hard"}
@@ -251,18 +302,50 @@ class ADAM:
             options["position"] = self.reset_position
         if self.track_player:
             options["track_player"] = True
-        for material in self.observation_item_space:
-            options["inventory"] = get_inventory_number(options["inventory"], material)
+        if action != "gatherWoodLog":
+            for material in self.observation_item_space:
+                options["inventory"] = get_inventory_number(options["inventory"], material)
         reset_result = env.reset(options=options)
         time.sleep(1)
-        start_item = reset_result[0][1]['inventory']
+        start_item = get_latest_inventory(reset_result)
         print(f"Action {action} start_item={start_item}")
-        env.step(skill_loader(action))
-        _, end_item, consumed_items, added_items = self.wait_for_inventory_progress(env, start_item)
+        action_result = env.step(skill_loader(action))
+        end_item = get_latest_inventory(action_result, start_item)
+        consumed_items, added_items = get_item_changes(start_item, end_item)
+        save_marker = get_latest_save_marker(action_result)
+        print(
+            f"Action {action} immediate_result: "
+            f"start_item={start_item}, end_item={end_item}, save_marker={save_marker}"
+        )
+        if not added_items and not save_marker:
+            _, end_item, consumed_items, added_items, save_marker = self.wait_for_inventory_progress(
+                env, start_item
+            )
+        if action == "gatherWoodLog":
+            if save_marker == "wood_log_gathered:expected_item_picked":
+                print(
+                    f"Action {action} confirmed by save marker: "
+                    f"start_item={start_item}, end_item={end_item}, save_marker={save_marker}, added_items={added_items}"
+                )
+                with lock:
+                    recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
+                    self.update_material_dict(end_item)
+                env.close()
+                time.sleep(1)
+                return True
+            if save_marker in {"wood_log_gathered:side_drop_only", "wood_log_gathered:no_progress"}:
+                print(
+                    f"Action {action} did not confirm expected log pickup. "
+                    f"Final start_item={start_item}, end_item={end_item}, "
+                    f"save_marker={save_marker}, added_items={added_items}"
+                )
+                env.close()
+                time.sleep(1)
+                return False
         if not added_items:
             print(
                 f"Action {action} produced no added items from the current local world state. "
-                f"Final start_item={start_item}, end_item={end_item}"
+                f"Final start_item={start_item}, end_item={end_item}, save_marker={save_marker}"
             )
             env.close()
             time.sleep(1)
@@ -270,14 +353,14 @@ class ADAM:
         if not has_expected_action_progress(action, added_items):
             print(
                 f"Action {action} added items {added_items}, but none match the expected progress type. "
-                f"Final start_item={start_item}, end_item={end_item}"
+                f"Final start_item={start_item}, end_item={end_item}, save_marker={save_marker}"
             )
             env.close()
             time.sleep(1)
             return False
         print(
             f"Action {action} inventory progress detected: "
-            f"start_item={start_item}, end_item={end_item}, added_items={added_items}"
+            f"start_item={start_item}, end_item={end_item}, added_items={added_items}, save_marker={save_marker}"
         )
         with lock:
             recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
@@ -300,6 +383,7 @@ class ADAM:
                         time.sleep(0.5)
                     results = [future.result() for future in futures]
                 success_count += results.count(True)
+            return True
         else:
             for i in range(self.infer_sampling_num):
                 print(f'Sampling {i + 1} started')
@@ -309,6 +393,7 @@ class ADAM:
                         f"Continuing so the visible in-game search result remains inspectable."
                     )
                     return False
+            return True
 
     def causal_verification_once(self, env, options_orig, action, effect_item):
         try:
@@ -321,12 +406,12 @@ class ADAM:
                 options_orig["track_player"] = True
             reset_result = env.reset(options=options_orig)
             time.sleep(1)
-            start_item = reset_result[0][1]['inventory']
+            start_item = get_latest_inventory(reset_result)
             env.step(skill_loader(action))
             time.sleep(1)
             result = env.step('')
             time.sleep(1)
-            end_item = result[0][1]['inventory']
+            end_item = get_latest_inventory(result, start_item)
             consumed_items, added_items = get_item_changes(start_item, end_item)
             with lock:
                 recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
@@ -370,10 +455,22 @@ class ADAM:
                                 }
 
             print(f'Start action {action}')
-            self.sampling_and_recording_action(action)
+            if self.sampling_and_recording_action(action) is False:
+                self.record["loop_list"].append(self.loop_record)
+                print(f"Sampling for {action} failed; skipping causal inference for this loop.")
+                continue
+
+            if not os.path.exists(record_json_path):
+                self.record["loop_list"].append(self.loop_record)
+                print(f"No valid sampling record for {action}; skipping causal inference for this loop.")
+                continue
 
             with open(record_json_path, 'r') as file:
                 data = json.load(file)
+            if not data:
+                self.record["loop_list"].append(self.loop_record)
+                print(f"Sampling record for {action} is empty; skipping causal inference for this loop.")
+                continue
             CD_prompt = copy.deepcopy(self.CD_prompt)
             dict_string = '\n'.join(
                 [f"'{key}': '{Adam.util_info.material_names_dict[key]}'" for key in self.observation_item_space])

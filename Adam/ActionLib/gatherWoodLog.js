@@ -1,7 +1,10 @@
 async function gatherWoodLog(bot) {
   const { goals } = require("mineflayer-pathfinder");
   const { GoalNear } = goals;
+  const mcData = require("minecraft-data")(bot.version);
   const debugChatEnabled = process.env.ADAM_DEBUG_CHAT === "1";
+  const startedAt = Date.now();
+  const actionTimeoutMs = 150000;
 
   bot.chat("Gathering wood logs started near current position");
 
@@ -95,6 +98,25 @@ async function gatherWoodLog(bot) {
     }
   }
 
+  function isTimedOut() {
+    return Date.now() - startedAt > actionTimeoutMs;
+  }
+
+  function withTimeout(promise, timeoutMs, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  }
+
+  async function runCommand(command, extraTicks = 2) {
+    debugMessage(`[ADAM_DEBUG][gatherWoodLog] command=${command}`);
+    bot.chat(command);
+    await bot.waitForTicks(bot.waitTicks * extraTicks);
+  }
+
   function summarizeNearbyDrops(radius = 8) {
     return Object.values(bot.entities)
       .filter(entity => {
@@ -106,6 +128,18 @@ async function gatherWoodLog(bot) {
         );
       })
       .map(entity => ({
+        item: (() => {
+          const itemMeta = entity.metadata && entity.metadata[8];
+          if (!itemMeta || !itemMeta.present) {
+            return null;
+          }
+          const itemInfo = mcData.items[itemMeta.itemId] || null;
+          return {
+            id: itemMeta.itemId,
+            name: itemInfo ? itemInfo.name : null,
+            count: itemMeta.itemCount,
+          };
+        })(),
         id: entity.id,
         position: {
           x: Number(entity.position.x.toFixed(2)),
@@ -123,8 +157,12 @@ async function gatherWoodLog(bot) {
       }));
   }
 
-  async function waitForInventoryChange(previousTotalCount, maxChecks = 8, waitTicks = 10) {
+  async function waitForInventoryChange(previousTotalCount, maxChecks = 4, waitTicks = 10) {
     for (let index = 0; index < maxChecks; index += 1) {
+      if (isTimedOut()) {
+        debugMessage("[ADAM_DEBUG][gatherWoodLog] wait_inventory_timeout");
+        return false;
+      }
       await bot.waitForTicks(waitTicks);
       const inventoryNow = summarizeInventory();
       const totalCount = inventoryNow.reduce((sum, item) => sum + item.count, 0);
@@ -145,13 +183,17 @@ async function gatherWoodLog(bot) {
           )[0];
         if (closestDrop) {
           try {
-            await bot.pathfinder.goto(
+            await withTimeout(
+              bot.pathfinder.goto(
               new GoalNear(
                 Math.floor(closestDrop.position.x),
                 Math.floor(closestDrop.position.y),
                 Math.floor(closestDrop.position.z),
                 1
               )
+              ),
+              8000,
+              "pickup goto"
             );
           } catch (error) {
             bot.chat(`Pickup path failed near drop ${closestDrop.id}`);
@@ -160,6 +202,116 @@ async function gatherWoodLog(bot) {
       }
     }
     return false;
+  }
+
+  function getTargetItemNamesForBlock(blockName) {
+    if (!blockName || !blockName.endsWith("_log")) {
+      return [];
+    }
+    return [blockName];
+  }
+
+  function hasExpectedItems(addedItems, expectedItemNames) {
+    return expectedItemNames.some(itemName => (addedItems[itemName] || 0) > 0);
+  }
+
+  function getNearbyDropEntities(radius = 8) {
+    return Object.values(bot.entities)
+      .filter(entity => {
+        return (
+          entity &&
+          entity.name === "item" &&
+          entity.position &&
+          entity.position.distanceTo(bot.entity.position) <= radius
+        );
+      });
+  }
+
+  async function confirmPickupOrTimeout({
+    inventoryBefore,
+    targetBlockName,
+    maxChecks = 4,
+    waitTicks = 10,
+  }) {
+    const beforeTotal = inventoryBefore.reduce((sum, item) => sum + item.count, 0);
+    const expectedItemNames = getTargetItemNamesForBlock(targetBlockName);
+    const initialDropIds = new Set(getNearbyDropEntities().map(entity => entity.id));
+    let lastInventory = inventoryBefore;
+    let lastDelta = { added: {}, removed: {} };
+    let dropEntityConsumed = initialDropIds.size === 0;
+    let expectedItemPicked = false;
+
+    for (let index = 0; index < maxChecks; index += 1) {
+      if (isTimedOut()) {
+        debugMessage("[ADAM_DEBUG][gatherWoodLog] confirm_pickup_timeout");
+        break;
+      }
+      await bot.waitForTicks(waitTicks);
+      const currentInventory = summarizeInventory();
+      lastInventory = currentInventory;
+      lastDelta = diffInventory(inventoryBefore, currentInventory);
+      const currentDropEntities = getNearbyDropEntities();
+      const currentDropIds = new Set(currentDropEntities.map(entity => entity.id));
+      dropEntityConsumed =
+        initialDropIds.size > 0 &&
+        [...initialDropIds].every(id => !currentDropIds.has(id));
+      expectedItemPicked = hasExpectedItems(lastDelta.added, expectedItemNames);
+
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] confirm_pickup=${index + 1}/${maxChecks} expected=${JSON.stringify(expectedItemNames)} added=${JSON.stringify(lastDelta.added)} dropEntityConsumed=${dropEntityConsumed} currentDrops=${JSON.stringify(
+          currentDropEntities.map(entity => ({
+            id: entity.id,
+            x: Number(entity.position.x.toFixed(2)),
+            y: Number(entity.position.y.toFixed(2)),
+            z: Number(entity.position.z.toFixed(2)),
+          }))
+        )}`
+      );
+
+      const totalCount = currentInventory.reduce((sum, item) => sum + item.count, 0);
+      if (!expectedItemPicked && totalCount > beforeTotal && currentDropEntities.length) {
+        const closestDrop = currentDropEntities
+          .sort(
+            (a, b) =>
+              a.position.distanceTo(bot.entity.position) -
+              b.position.distanceTo(bot.entity.position)
+          )[0];
+        try {
+          await withTimeout(
+            bot.pathfinder.goto(
+            new GoalNear(
+              Math.floor(closestDrop.position.x),
+              Math.floor(closestDrop.position.y),
+              Math.floor(closestDrop.position.z),
+              1
+            )
+            ),
+            8000,
+            "confirm pickup goto"
+          );
+        } catch (error) {
+          debugMessage(
+            `[ADAM_DEBUG][gatherWoodLog] pickup_retry_failed drop=${closestDrop.id} error=${error.message}`
+          );
+        }
+      }
+
+      if (expectedItemPicked || dropEntityConsumed) {
+        return {
+          success: expectedItemPicked,
+          dropEntityConsumed,
+          inventoryAfter: currentInventory,
+          inventoryDelta: lastDelta,
+        };
+      }
+    }
+
+    return {
+      success: false,
+      dropEntityConsumed,
+      inventoryAfter: lastInventory,
+      inventoryDelta: lastDelta,
+    };
   }
 
   function getNearbyLogBlocks(radius, count = 24) {
@@ -214,12 +366,19 @@ async function gatherWoodLog(bot) {
     return;
   }
 
-  const mineTargets = targets.slice(0, 4);
+  const mineTargets = targets.slice(0, 1);
   bot.chat(`Mining up to ${mineTargets.length} nearby wood logs.`);
 
   let minedTargetCount = 0;
   let inventoryProgressCount = 0;
+  let expectedPickupCount = 0;
+  let sideDropOnlyCount = 0;
+  let noProgressCount = 0;
   for (const target of mineTargets) {
+    if (isTimedOut()) {
+      debugMessage("[ADAM_DEBUG][gatherWoodLog] action_timeout_before_next_target");
+      break;
+    }
     const liveTarget = bot.blockAt(target.position);
     if (!liveTarget || !logNames.includes(liveTarget.name)) {
       continue;
@@ -239,17 +398,27 @@ async function gatherWoodLog(bot) {
       debugMessage(
         `[ADAM_DEBUG][gatherWoodLog] target_neighbors below=${below ? below.name : "null"} above=${above ? above.name : "null"}`
       );
+      debugMessage(
+        `[ADAM_DEBUG][gatherWoodLog] gameMode=${bot.game ? bot.game.gameMode : "unknown"}`
+      );
+      await runCommand("/gamemode survival @s");
+      await runCommand("/gamerule doTileDrops true");
+      await runCommand("/gamerule doTileDrops");
 
-      await bot.pathfinder.goto(
+      await withTimeout(
+        bot.pathfinder.goto(
         new GoalNear(
           liveTarget.position.x,
           liveTarget.position.y,
           liveTarget.position.z,
           1
         )
+        ),
+        10000,
+        "target goto"
       );
       await bot.lookAt(liveTarget.position.offset(0.5, 0.5, 0.5), true);
-      await bot.dig(liveTarget);
+      await withTimeout(bot.dig(liveTarget), 8000, "dig");
       minedTargetCount += 1;
       bot.chat(
         `Mined target block ${liveTarget.name} at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`
@@ -264,13 +433,17 @@ async function gatherWoodLog(bot) {
       if (nearbyDropsAfterDig.length) {
         for (const drop of nearbyDropsAfterDig) {
           try {
-            await bot.pathfinder.goto(
+            await withTimeout(
+              bot.pathfinder.goto(
               new GoalNear(
                 Math.floor(drop.position.x),
                 Math.floor(drop.position.y),
                 Math.floor(drop.position.z),
                 1
               )
+              ),
+              8000,
+              "drop goto"
             );
             await bot.waitForTicks(bot.waitTicks);
           } catch (error) {
@@ -280,17 +453,30 @@ async function gatherWoodLog(bot) {
       }
 
       const gotInventoryProgress = await waitForInventoryChange(inventoryBeforeTotal, 12, 10);
-      const inventoryAfter = summarizeInventory();
-      const inventoryDelta = diffInventory(inventoryBefore, inventoryAfter);
+      const pickupResult = await confirmPickupOrTimeout({
+        inventoryBefore,
+        targetBlockName: liveTarget.name,
+        maxChecks: 12,
+        waitTicks: 10,
+      });
+      const inventoryAfter = pickupResult.inventoryAfter;
+      const inventoryDelta = pickupResult.inventoryDelta;
       debugMessage(
         `[ADAM_DEBUG][gatherWoodLog] inventory_delta target=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z} added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
       );
-      if (gotInventoryProgress) {
+      if (pickupResult.success) {
         inventoryProgressCount += 1;
+        expectedPickupCount += 1;
         bot.chat(
-          `Inventory changed after mining ${liveTarget.name}: added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
+          `Picked expected item after mining ${liveTarget.name}: added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
+        );
+      } else if (gotInventoryProgress || Object.keys(inventoryDelta.added).length > 0) {
+        sideDropOnlyCount += 1;
+        bot.chat(
+          `Side-drop only after mining ${liveTarget.name}: added=${JSON.stringify(inventoryDelta.added)} removed=${JSON.stringify(inventoryDelta.removed)}`
         );
       } else {
+        noProgressCount += 1;
         debugMessage(
           `[ADAM_DEBUG][gatherWoodLog] no_inventory_progress target=${liveTarget.position.x},${liveTarget.position.y},${liveTarget.position.z}`
         );
@@ -298,6 +484,7 @@ async function gatherWoodLog(bot) {
           `No inventory progress after mining ${liveTarget.name} at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}`
         );
       }
+      break;
     } catch (error) {
       bot.chat(`Skipping unreachable log at ${liveTarget.position.x} ${liveTarget.position.y} ${liveTarget.position.z}: ${error.message}`);
       debugMessage(
@@ -324,6 +511,18 @@ async function gatherWoodLog(bot) {
     console.log(`[ADAM_DEBUG][gatherWoodLog] inventory_after_error=${error.message}`);
   }
 
-  bot.save("wood_log_gathered");
-  bot.chat(`Mined ${minedTargetCount} target log blocks. Inventory progress observed on ${inventoryProgressCount}.`);
+  let saveMarker = "wood_log_gathered:none";
+  if (expectedPickupCount > 0) {
+    saveMarker = "wood_log_gathered:expected_item_picked";
+  } else if (sideDropOnlyCount > 0) {
+    saveMarker = "wood_log_gathered:side_drop_only";
+  } else if (noProgressCount > 0) {
+    saveMarker = "wood_log_gathered:no_progress";
+  }
+
+  bot.save(saveMarker);
+  bot.chat(
+    `Mined ${minedTargetCount} target log blocks. Inventory progress observed on ${inventoryProgressCount}. ` +
+    `Expected pickups=${expectedPickupCount}, sideDrops=${sideDropOnlyCount}, noProgress=${noProgressCount}.`
+  );
 }

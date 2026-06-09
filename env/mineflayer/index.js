@@ -103,6 +103,12 @@ async function runCommand(botInstance, command, extraTicks = 1) {
     await botInstance.waitForTicks(botInstance.waitTicks * extraTicks);
 }
 
+async function runDebugCommand(botInstance, command, extraTicks = 2) {
+    console.log(`[ADAM_DEBUG][command] ${command}`);
+    botInstance.chat(command);
+    await botInstance.waitForTicks(botInstance.waitTicks * extraTicks);
+}
+
 function getTrackedPlayerSpawnPosition(playerEntity) {
     const baseX = playerEntity.position.x;
     const baseY = playerEntity.position.y;
@@ -153,6 +159,10 @@ app.post("/start", (req, res) => {
     bot.stuckTickCounter = 0;
     bot.stuckPosList = [];
     bot.iron_pickaxe = false;
+    bot.latestSaveMarker = null;
+    bot.on("save", (eventName) => {
+        bot.latestSaveMarker = eventName;
+    });
 
     bot.on("kicked", (reason, loggedIn) => {
         console.log(`Mineflayer bot kicked. loggedIn=${loggedIn} reason=${reason}`);
@@ -171,7 +181,7 @@ app.post("/start", (req, res) => {
                 const mineflayerViewer = require('prismarine-viewer').mineflayer
                 mineflayerViewer(bot, {
                     firstPerson: false,
-                    viewDistance: 3,
+                    viewDistance: 2,
                     port: Number(VISUAL_SERVER_PORT),
                     host: "0.0.0.0",
                 });
@@ -186,6 +196,9 @@ app.post("/start", (req, res) => {
         bot.removeListener("error", onConnectionFailed);
         let itemTicks = 1;
         if (req.body.reset === "hard") {
+            await runDebugCommand(bot, "/gamemode survival @s");
+            await runDebugCommand(bot, "/gamerule doTileDrops true");
+            await runDebugCommand(bot, "/gamerule doTileDrops");
             await runCommand(bot, "/clear @s");
             const inventory = req.body.inventory ? req.body.inventory : {};
             const equipment = req.body.equipment
@@ -244,6 +257,9 @@ app.post("/start", (req, res) => {
             );
         }
 
+        await runCommand(bot, "/kill @e[type=item,distance=..128]");
+        console.log(`[ADAM_DEBUG][start] gameMode=${bot.game ? bot.game.gameMode : "unknown"}`);
+
         // if iron_pickaxe is in bot's inventory
         // if (
         //     bot.inventory.items().find((item) => item.name === "iron_pickaxe")
@@ -284,6 +300,7 @@ app.post("/start", (req, res) => {
         await bot.waitForTicks(bot.waitTicks * itemTicks);
         const initialObservation = bot.observe();
         initialObservation[1]["viewerStatus"] = viewerStatus;
+        initialObservation[1]["saveMarker"] = bot.latestSaveMarker;
         res.json(initialObservation);
 
         initCounter(bot);
@@ -431,6 +448,7 @@ app.post("/step", async (req, res) => {
         response_sent = true;
         const finalObservation = bot.observe();
         finalObservation[1]["viewerStatus"] = viewerStatus;
+        finalObservation[1]["saveMarker"] = bot.latestSaveMarker;
         res.json(finalObservation);
     }
     bot.removeListener("physicTick", onTick);
@@ -482,32 +500,34 @@ app.post("/step", async (req, res) => {
         }
     }
 
-    function returnItems() {
-        bot.chat("/gamerule doTileDrops false");
+    async function returnItems() {
+        await runCommand(bot, "/gamerule doTileDrops false");
         const crafting_table = bot.findBlock({
             matching: mcData.blocksByName.crafting_table.id,
             maxDistance: 128,
         });
         if (crafting_table) {
-            bot.chat(
+            await runCommand(
+                bot,
                 `/setblock ${crafting_table.position.x} ${crafting_table.position.y} ${crafting_table.position.z} air destroy`
             );
-            bot.chat("/give @s crafting_table");
+            await runCommand(bot, "/give @s crafting_table");
         }
         const furnace = bot.findBlock({
             matching: mcData.blocksByName.furnace.id,
             maxDistance: 128,
         });
         if (furnace) {
-            bot.chat(
+            await runCommand(
+                bot,
                 `/setblock ${furnace.position.x} ${furnace.position.y} ${furnace.position.z} air destroy`
             );
-            bot.chat("/give @s furnace");
+            await runCommand(bot, "/give @s furnace");
         }
         if (bot.inventoryUsed() >= 32) {
             // if chest is not in bot's inventory
             if (!bot.inventory.items().find((item) => item.name === "chest")) {
-                bot.chat("/give @s chest");
+                await runCommand(bot, "/give @s chest");
             }
         }
         // if iron_pickaxe not in bot's inventory and bot.iron_pickaxe
@@ -517,7 +537,7 @@ app.post("/step", async (req, res) => {
         // ) {
         //     bot.chat("/give @s iron_pickaxe");
         // }
-        bot.chat("/gamerule doTileDrops true");
+        await runCommand(bot, "/gamerule doTileDrops true");
     }
 
     function handleError(err) {
