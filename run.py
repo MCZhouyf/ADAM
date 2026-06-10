@@ -9,7 +9,7 @@ from Adam.ADAM import ADAM
 DEFAULT_VIEWER_PORT = 3007
 DEFAULT_GAME_SERVER_PORT = 3000
 MINEFLAYER_PATTERN = "/root/ADAM-sparse/env/mineflayer/index.js"
-DEFAULT_GOAL_ITEMS = ["crafting_table"]
+DEFAULT_GOAL_ITEMS = ["planks"]
 DEFAULT_GOAL_ENVIRONMENT = ["grass"]
 QUIET_BOOT = os.environ.get("ADAM_QUIET_BOOT", "1") != "0"
 
@@ -358,4 +358,8 @@ print_gpu_process_status()
 ADAM.run_visual_API()
 print("Visual screenshot capture enabled.")
 
-ADAM.explore(goal_items, goal_environment)
+try:
+    ADAM.explore(goal_items, goal_environment)
+finally:
+    ADAM.stop_visual_API()
+    ADAM.env.close()

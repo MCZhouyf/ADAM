@@ -21,7 +21,7 @@ const {GoalXZ, GoalBlock} = goals
 let bot = null;
 let viewerStatus = "disabled";
 let viewerHost = "127.0.0.1";
-const VIEWER_DISTANCE = Number(process.env.ADAM_VIEWER_DISTANCE || 6);
+const VIEWER_DISTANCE = Number(process.env.ADAM_VIEWER_DISTANCE || 5);
 
 function isAirLike(block) {
     return !block || block.name === "air" || block.name === "cave_air" || block.name === "void_air";

@@ -132,6 +132,7 @@ class ADAM:
         self.llm_model_type = llm_model_type
         self.use_local_llm_service = use_local_llm_service
         self.visual_api_started = False
+        self.visual_api_monitor = None
         self.record = None
         self.loop_record = None
         # Observation Item Space S
@@ -268,6 +269,43 @@ class ADAM:
         return '\n'.join([f"Action: {key}; Cause: {value[0]}; Effect {value[1]}" for key, value in
                           self.learned_causal_subgraph.items()])
 
+    def format_item_key(self, item_key):
+        return translate_item_letter_to_name(item_key)
+
+    def format_action_key(self, action_key):
+        return translate_action_letter_to_name(action_key)
+
+    def format_causal_graph_for_display(self):
+        lines = []
+        for action_key, value in self.learned_causal_subgraph.items():
+            causes, effects = value
+            action_name = self.format_action_key(action_key)
+            cause_names = [self.format_item_key(item) for item in causes]
+            effect_names = [self.format_item_key(item) for item in effects]
+            lines.append(
+                f"Action: {action_name}; Cause: {cause_names}; Effect: {effect_names}"
+            )
+        return '\n'.join(lines)
+
+    def format_plan_for_display(self, plan):
+        return " -> ".join(self.format_action_key(action_key) for action_key in plan)
+
+    def format_item_plan_for_display(self, plan):
+        return " -> ".join(self.describe_plan_items(plan))
+
+    def print_plan_summary(self, header="Final learned plan summary"):
+        print(header)
+        print("LLM action plan: " + self.format_plan_for_display(self.planned_actions))
+        print(
+            "LLM item plan: goal "
+            + ", ".join(self.goal[0])
+            + " needs "
+            + self.format_item_plan_for_display(self.planned_actions)
+        )
+        print("Actions and Dependencies:")
+        for dependency_line in self.get_action_dependency_lines(self.planned_actions):
+            print(dependency_line)
+
     def describe_plan_items(self, plan):
         item_chain = []
         action_to_effect = {
@@ -321,9 +359,26 @@ class ADAM:
 
     def get_action_mapping_prompt(self):
         return '\n'.join(
-            f"{letter}: {name}"
+            f"{name}"
             for letter, name in Adam.util_info.action_names_dict.items()
         )
+
+    def get_action_dependency_lines(self, plan):
+        dependency_lines = []
+        for action_key in plan:
+            action_name = self.format_action_key(action_key)
+            known_entry = self.learned_causal_subgraph.get(action_key)
+            if known_entry:
+                causes, effects = known_entry
+                cause_names = [self.format_item_key(item) for item in causes] or ["nothing"]
+                effect_names = [self.format_item_key(item) for item in effects] or ["unknown"]
+            else:
+                effect_names = [item for item in self.describe_plan_items([action_key])] or ["unknown"]
+                cause_names = ["to be learned"]
+            dependency_lines.append(
+                f"{action_name}: requires {', '.join(cause_names)} -> produces {', '.join(effect_names)}"
+            )
+        return dependency_lines
 
     def get_goal_fallback_plan(self):
         goal_items = {rename_item(item) for item in self.goal[0]}
@@ -395,16 +450,16 @@ Goal environmental factors: {self.goal[1]}
 Planning reason: {reason_text}
 Current planned actions: {self.planned_actions or "None"}
 Known learned causal graph:
-{self.get_causal_graph() or "None"}
+{self.format_causal_graph_for_display() or "None"}
 
 Available actions:
 {self.get_action_mapping_prompt()}
 
-Return only one brace-wrapped ordered action path, using action letters or exact action names.
+Return only one brace-wrapped ordered action path, using exact action names.
 The path must include every action needed to produce intermediate ingredients before they are used.
 Do not assume a later crafting action can run unless its ingredient-producing actions already appear earlier.
 If the previous action failed, treat that as evidence that the current recipe/order may be wrong and return a corrected plan.
-Example format: {{A,B,D,C,K,M,R,S,T,U}}
+Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
 """
         try:
             response_text = self.get_llm_answer(prompt)
@@ -418,14 +473,17 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
             plan = fallback_plan
         print(
             "Dynamic learning plan: "
-            + " -> ".join(f"{letter}:{translate_action_letter_to_name(letter)}" for letter in plan)
+            + self.format_plan_for_display(plan)
         )
         print(
             "LLM item plan: goal "
             + ", ".join(self.goal[0])
             + " needs "
-            + " -> ".join(self.describe_plan_items(plan))
+            + self.format_item_plan_for_display(plan)
         )
+        print("Actions and Dependencies:")
+        for dependency_line in self.get_action_dependency_lines(plan):
+            print(dependency_line)
         self.planned_actions = plan
         self.unlocked_actions = list(dict.fromkeys(self.unlocked_actions + plan))
         return plan
@@ -664,7 +722,12 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
                 self.record["loop_list"].append(self.loop_record)
                 print('LLM inference failed')
                 continue
-            print(f'Causal assumption: Cause:{cause}, Effect:{effect}')
+            print(
+                "Causal assumption: Cause:"
+                + str([self.format_item_key(item) for item in cause])
+                + ", Effect:"
+                + str([self.format_item_key(item) for item in effect])
+            )
             self.loop_record["cause_llm"] = cause
             self.loop_record['effect_llm'] = effect
             for effect_item in effect:
@@ -696,8 +759,8 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
                     cause.remove(item)
 
                 print('Causal relation found!')
-                print('Cause:', cause)
-                print('Effect:', effect_item)
+                print('Cause:', [self.format_item_key(item) for item in cause])
+                print('Effect:', self.format_item_key(effect_item))
                 self.loop_record["cause_found"] = cause
                 self.loop_record["effect_found"] = effect_item
                 with open(U.f_join(self.dataset_path, 'causal_result', action + '.json'), 'w') as json_file:
@@ -823,6 +886,7 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
             self.update_material_dict(end_item)
             self.update_memory(action, consumed_items, added_items, environment_description)
             if self.check_goal_completed(result):
+                print("Controller goal completed. Stopping controller loop.")
                 return
 
     def check_goal_completed(self, result):
@@ -846,17 +910,17 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
                 continue
             action_name = translate_action_letter_to_name(action)
             self.record = self.init_record_structure(action)
-            print(f"Learning planned action {action}:{action_name}")
+            print(f"Learning planned action {action_name}")
             if self.causal_learning(action_name):
                 learned_any = True
                 if action not in self.learned_causal_subgraph:
                     print(
-                        f"Planned action {action}:{action_name} sampled but no verified causal edge was added."
+                        f"Planned action {action_name} sampled but no verified causal edge was added."
                     )
                 if all(item in self.learned_items for item in self.goal_item_letters):
                     break
             else:
-                print(f"Planned action {action}:{action_name} failed; will retry after replanning/fallback.")
+                print(f"Planned action {action_name} failed; will retry after replanning/fallback.")
                 return learned_any, action
         return learned_any, None
 
@@ -880,9 +944,19 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
             print("Dynamic learning plan made no progress; asking LLM to analyze and replan.")
             self.plan_learning_path(reason=reason)
 
-        self.controller()
-        while len(self.learned_causal_subgraph.keys()) < len(self.unlocked_actions):
-            self.learn_new_actions()
+        self.print_plan_summary()
+        print("Learning phase finished. Entering controller(). Post-controller supplemental learning is disabled.")
+        try:
+            self.controller()
+        finally:
+            self.stop_visual_API()
+        return
+
+    def stop_visual_API(self):
+        if self.visual_api_monitor is not None:
+            self.visual_api_monitor.stop()
+            self.visual_api_monitor = None
+        self.visual_api_started = False
 
     def run_visual_API(self):
         if self.visual_api_started:
@@ -893,7 +967,10 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
         visual_env = os.environ.copy()
         visual_env["PYTHONUNBUFFERED"] = "1"
         visual_env["ADAM_VISUAL_API_URL"] = f"http://127.0.0.1:{self.env.visual_server_port}"
-        visual_env["ADAM_VISUAL_IMAGE_DIR"] = os.path.join("Adam", "game_image")
+        visual_env["ADAM_VISUAL_IMAGE_DIR"] = os.environ.get(
+            "ADAM_VISUAL_IMAGE_DIR",
+            os.path.join("Adam", "game_image"),
+        )
         monitor = SubprocessMonitor(
             commands=commands,
             name="VisualAPIMonitor",
@@ -905,4 +982,5 @@ Example format: {{A,B,D,C,K,M,R,S,T,U}}
             env=visual_env,
         )
         monitor.run()
+        self.visual_api_monitor = monitor
         self.visual_api_started = True

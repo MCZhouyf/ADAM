@@ -1,7 +1,12 @@
+import os
+
 import requests
 
 
-def get_image_description(image_path='Adam/game_image/tmp.png', local_mllm_port=7000):
+def get_image_description(image_path=None, local_mllm_port=7000):
+    if image_path is None:
+        image_dir = os.environ.get("ADAM_VISUAL_IMAGE_DIR", "Adam/game_image")
+        image_path = os.path.join(image_dir, "tmp.png")
     text = 'Please describe this Minecraft image'
     url = 'http://localhost:' + str(local_mllm_port) + '/send_image_text'
     data = {'text': text}

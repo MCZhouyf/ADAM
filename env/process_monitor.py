@@ -82,8 +82,16 @@ class SubprocessMonitor:
     def stop(self):
         self.logger.info("Stopping subprocess.")
         if self.process and self.process.is_running():
-            self.process.terminate()
-            self.process.wait()
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    self.process.wait(timeout=5)
+                except Exception:
+                    self.process.kill()
+                    self.process.wait()
 
     @property
     def is_running(self):
