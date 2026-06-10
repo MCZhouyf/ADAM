@@ -29,6 +29,9 @@ class VisualAPI:
     def find_viewer_window_id(self):
         search_commands = [
             ["xdotool", "search", "--onlyvisible", "--name", self.viewer_url],
+            ["xdotool", "search", "--onlyvisible", "--name", "Google Chrome"],
+            ["xdotool", "search", "--onlyvisible", "--name", "Chrome"],
+            ["xdotool", "search", "--onlyvisible", "--name", "Chromium"],
             ["xdotool", "search", "--onlyvisible", "--name", "Mozilla Firefox"],
         ]
         env = os.environ.copy()
@@ -48,7 +51,9 @@ class VisualAPI:
             window_ids = [line.strip() for line in output.splitlines() if line.strip()]
             if window_ids:
                 return window_ids[-1]
-        raise RuntimeError(f"Could not find a visible Firefox viewer window for {self.viewer_url}")
+        raise RuntimeError(
+            f"Could not find a visible browser viewer window for {self.viewer_url}"
+        )
 
     def capture_window(self, window_id, screenshot_path):
         env = os.environ.copy()

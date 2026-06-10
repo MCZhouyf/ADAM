@@ -22,6 +22,8 @@ lock = threading.Lock()
 def has_expected_action_progress(action, added_items):
     if action == "gatherWoodLog":
         return any(str(item).endswith("_log") for item in added_items)
+    if action == "gatherStone":
+        return "cobblestone" in added_items
     return bool(added_items)
 
 
@@ -129,11 +131,14 @@ class ADAM:
         self.max_llm_answer_num = max_llm_answer_num
         self.llm_model_type = llm_model_type
         self.use_local_llm_service = use_local_llm_service
+        self.visual_api_started = False
         self.record = None
         self.loop_record = None
         # Observation Item Space S
         self.observation_item_space = []
         self.unlocked_actions = ['A']
+        self.use_dynamic_planning = True
+        self.planned_actions = []
         # Learned causal subgraph is represented as {action : [[causes],[effects]]}
         self.learned_causal_subgraph = {}
         self.learned_items = set()
@@ -233,6 +238,7 @@ class ADAM:
             'memory': self.memory,  # serve as log
             'goal': self.goal,
             'goal_item_letters': self.goal_item_letters,
+            'planned_actions': self.planned_actions,
             'material_names_dict': Adam.util_info.material_names_dict,
             'material_names_rev_dict': Adam.util_info.material_names_rev_dict
         }
@@ -249,6 +255,7 @@ class ADAM:
         self.learned_items = set(state['learned_items'])
         self.goal = tuple(state['goal'])
         self.goal_item_letters = state['goal_item_letters']
+        self.planned_actions = state.get('planned_actions', [])
         Adam.util_info.material_names_dict = state['material_names_dict']
         Adam.util_info.material_names_rev_dict = state['material_names_rev_dict']
 
@@ -260,6 +267,168 @@ class ADAM:
     def get_causal_graph(self):
         return '\n'.join([f"Action: {key}; Cause: {value[0]}; Effect {value[1]}" for key, value in
                           self.learned_causal_subgraph.items()])
+
+    def describe_plan_items(self, plan):
+        item_chain = []
+        action_to_effect = {
+            "A": "log",
+            "B": "planks",
+            "C": "crafting_table",
+            "D": "sticks",
+            "E": "fence",
+            "F": "fence_gate",
+            "G": "wooden_axe",
+            "H": "wooden_hoe",
+            "I": "wooden_shovel",
+            "J": "wooden_sword",
+            "K": "wooden_pickaxe",
+            "L": "coal",
+            "M": "cobblestone",
+            "N": "stone_axe",
+            "O": "stone_hoe",
+            "P": "stone_shovel",
+            "Q": "stone_sword",
+            "R": "stone_pickaxe",
+            "S": "furnace",
+            "T": "raw_iron",
+            "U": "iron_ingot",
+            "V": "iron_axe",
+            "W": "iron_hoe",
+            "X": "iron_shovel",
+            "Y": "iron_sword",
+            "Z": "iron_pickaxe",
+            "AA": "raw_gold",
+            "AB": "diamond",
+            "AC": "diamond_axe",
+            "AD": "diamond_hoe",
+            "AE": "diamond_pickaxe",
+            "AF": "diamond_shovel",
+            "AG": "diamond_sword",
+            "AH": "dirt",
+            "AI": "sand",
+            "AJ": "gold_ingot",
+            "AK": "golden_axe",
+            "AL": "golden_hoe",
+            "AM": "golden_pickaxe",
+            "AN": "golden_shovel",
+            "AO": "golden_sword",
+        }
+        for action in plan:
+            item_name = action_to_effect.get(action)
+            if item_name and item_name not in item_chain:
+                item_chain.append(item_name)
+        return item_chain
+
+    def get_action_mapping_prompt(self):
+        return '\n'.join(
+            f"{letter}: {name}"
+            for letter, name in Adam.util_info.action_names_dict.items()
+        )
+
+    def get_goal_fallback_plan(self):
+        goal_items = {rename_item(item) for item in self.goal[0]}
+        if "iron_ingot" in goal_items:
+            return ["A", "B", "D", "C", "K", "M", "R", "S", "T", "U"]
+        if "raw_iron" in goal_items:
+            return ["A", "B", "D", "C", "K", "M", "R", "T"]
+        if "stone_pickaxe" in goal_items:
+            return ["A", "B", "D", "C", "K", "M", "R"]
+        if "cobblestone" in goal_items:
+            return ["A", "B", "D", "C", "K", "M"]
+        if "wooden_pickaxe" in goal_items:
+            return ["A", "B", "D", "C", "K"]
+        if "stick" in goal_items:
+            return ["A", "B", "D"]
+        if "crafting_table" in goal_items:
+            return ["A", "B", "C"]
+        if "planks" in goal_items:
+            return ["A", "B"]
+        if "log" in goal_items:
+            return ["A"]
+        return ["A"]
+
+    def normalize_planned_action(self, token):
+        token = token.strip().strip("'\"`[](){}")
+        if not token:
+            return None
+        upper_token = token.upper()
+        if upper_token in Adam.util_info.action_names_dict:
+            return upper_token
+        if token in Adam.util_info.action_names_rev_dict:
+            return Adam.util_info.action_names_rev_dict[token]
+        for action_name, action_letter in Adam.util_info.action_names_rev_dict.items():
+            if action_name.lower() == token.lower():
+                return action_letter
+        return None
+
+    def parse_learning_plan(self, response_text):
+        if not response_text:
+            return []
+        candidates = []
+        brace_matches = re.findall(r'{([^{}]*)}', response_text, re.DOTALL)
+        source_text = brace_matches[-1] if brace_matches else response_text
+        for token in re.split(r'[\s,;>\-\n]+', source_text):
+            action_letter = self.normalize_planned_action(token)
+            if action_letter and action_letter not in candidates:
+                candidates.append(action_letter)
+        return candidates
+
+    def ensure_valid_learning_plan(self, plan):
+        valid_plan = []
+        for action_letter in plan:
+            if action_letter in Adam.util_info.action_names_dict and action_letter not in valid_plan:
+                valid_plan.append(action_letter)
+        if not valid_plan:
+            valid_plan = self.get_goal_fallback_plan()
+        elif "A" not in valid_plan:
+            valid_plan.insert(0, "A")
+        return valid_plan
+
+    def plan_learning_path(self, reason=None):
+        fallback_plan = self.get_goal_fallback_plan()
+        reason_text = reason or "Initial planning request."
+        prompt = f"""
+You are planning the action-learning order for ADAM in Minecraft.
+
+Goal items: {self.goal[0]}
+Goal environmental factors: {self.goal[1]}
+Planning reason: {reason_text}
+Current planned actions: {self.planned_actions or "None"}
+Known learned causal graph:
+{self.get_causal_graph() or "None"}
+
+Available actions:
+{self.get_action_mapping_prompt()}
+
+Return only one brace-wrapped ordered action path, using action letters or exact action names.
+The path must include every action needed to produce intermediate ingredients before they are used.
+Do not assume a later crafting action can run unless its ingredient-producing actions already appear earlier.
+If the previous action failed, treat that as evidence that the current recipe/order may be wrong and return a corrected plan.
+Example format: {{A,B,D,C,K,M,R,S,T,U}}
+"""
+        try:
+            response_text = self.get_llm_answer(prompt)
+            print('\033[94m' + '-' * 20 + 'Learning Planner' + '-' * 20 + '\n' + response_text + '\033[0m')
+            plan = self.parse_learning_plan(response_text)
+        except Exception as e:
+            print(f"Learning planner failed, using fallback plan: {e}")
+            plan = fallback_plan
+        plan = self.ensure_valid_learning_plan(plan)
+        if not plan:
+            plan = fallback_plan
+        print(
+            "Dynamic learning plan: "
+            + " -> ".join(f"{letter}:{translate_action_letter_to_name(letter)}" for letter in plan)
+        )
+        print(
+            "LLM item plan: goal "
+            + ", ".join(self.goal[0])
+            + " needs "
+            + " -> ".join(self.describe_plan_items(plan))
+        )
+        self.planned_actions = plan
+        self.unlocked_actions = list(dict.fromkeys(self.unlocked_actions + plan))
+        return plan
 
     def wait_for_inventory_progress(self, env, start_item, max_checks=3, wait_seconds=1):
         last_result = None
@@ -407,17 +576,24 @@ class ADAM:
             reset_result = env.reset(options=options_orig)
             time.sleep(1)
             start_item = get_latest_inventory(reset_result)
+            print(f"Verification start_item={start_item}")
             env.step(skill_loader(action))
             time.sleep(1)
             result = env.step('')
             time.sleep(1)
             end_item = get_latest_inventory(result, start_item)
             consumed_items, added_items = get_item_changes(start_item, end_item)
+            verification_success = check_in_material(added_items, effect_item)
+            if action == "gatherStone" and effect_item in {"M", "cobblestone"}:
+                verification_success = "cobblestone" in added_items
+            print(f"Verification end_item={end_item}")
+            print(f"Verification added_items={added_items}")
+            print(f"Verification success={verification_success}")
             with lock:
                 recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
             env.close()
             time.sleep(1)
-            return check_in_material(added_items, effect_item)
+            return verification_success
         except Exception as e:
             print(f"Error during causal verification: {e}")
             return False
@@ -624,14 +800,16 @@ class ADAM:
             options["track_player"] = True
         self.env.reset(options=options)
         result = self.env.step('')
-        self.run_visual_API()
+        if not self.visual_api_started:
+            self.run_visual_API()
         while True:
             environment_description = get_image_description(local_mllm_port=self.local_mllm_port)
-            if all(item in translate_item_name_list_to_letter(result[0][1]['inventory'].keys()) for item in
+            latest_payload = result[0][1]
+            if all(item in translate_item_name_list_to_letter(latest_payload['inventory'].keys()) for item in
                    self.goal_item_letters):
                 subtask = 'Achieve the environmental factors.'
             else:
-                subtask = self.planner(result[0][1]['inventory'])
+                subtask = self.planner(latest_payload['inventory'])
             action = self.actor(subtask, environment_description)
             print('Action:', action)
             result = self.env.step(skill_loader(action))
@@ -651,26 +829,64 @@ class ADAM:
         return all(item in translate_item_name_list_to_letter(result[0][1]['inventory'].keys()) for item in
                    self.goal_item_letters) and all(item in result[0][1]['voxels'] for item in self.goal[1])
 
-    def learn_new_actions(self):
-        for action in reversed(self.unlocked_actions):
+    def learn_new_actions(self, candidate_actions=None):
+        actions = candidate_actions or self.unlocked_actions
+        for action in reversed(actions):
             if action not in self.learned_causal_subgraph.keys():
                 self.record = self.init_record_structure(action)
-                self.causal_learning(translate_action_letter_to_name(action))
-                break
+                return self.causal_learning(translate_action_letter_to_name(action))
+        return False
+
+    def learn_planned_actions(self):
+        if not self.planned_actions:
+            self.plan_learning_path()
+        learned_any = False
+        for action in self.planned_actions:
+            if action in self.learned_causal_subgraph:
+                continue
+            action_name = translate_action_letter_to_name(action)
+            self.record = self.init_record_structure(action)
+            print(f"Learning planned action {action}:{action_name}")
+            if self.causal_learning(action_name):
+                learned_any = True
+                if action not in self.learned_causal_subgraph:
+                    print(
+                        f"Planned action {action}:{action_name} sampled but no verified causal edge was added."
+                    )
+                if all(item in self.learned_items for item in self.goal_item_letters):
+                    break
+            else:
+                print(f"Planned action {action}:{action_name} failed; will retry after replanning/fallback.")
+                return learned_any, action
+        return learned_any, None
 
     def explore(self, goal_item, goal_environment):
         self.goal = (goal_item, goal_environment)
         self.goal_item_letters = translate_item_name_list_to_letter(self.goal[0])
-        while True:
-            if all(item in self.learned_items for item in self.goal_item_letters):
-                break
-            self.learn_new_actions()
+        self.plan_learning_path()
+        failed_learning_rounds = 0
+        while not all(item in self.learned_items for item in self.goal_item_letters):
+            learned_any, failed_action = self.learn_planned_actions()
+            if learned_any:
+                failed_learning_rounds = 0
+                continue
+            failed_learning_rounds += 1
+            reason = (
+                f"Previous plan made no progress. Failed action: {failed_action}. "
+                f"No-progress rounds: {failed_learning_rounds}. "
+                "Analyze whether the current action order is missing prerequisites or includes irrelevant actions, "
+                "then return a corrected ordered action plan."
+            )
+            print("Dynamic learning plan made no progress; asking LLM to analyze and replan.")
+            self.plan_learning_path(reason=reason)
 
         self.controller()
         while len(self.learned_causal_subgraph.keys()) < len(self.unlocked_actions):
             self.learn_new_actions()
 
     def run_visual_API(self):
+        if self.visual_api_started:
+            return
         python_executable = sys.executable
         script_path = os.path.join(os.getcwd(), 'Adam', "visual_API.py")
         commands = [python_executable, script_path]
@@ -689,3 +905,4 @@ class ADAM:
             env=visual_env,
         )
         monitor.run()
+        self.visual_api_started = True

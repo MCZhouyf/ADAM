@@ -9,6 +9,14 @@ from Adam.ADAM import ADAM
 DEFAULT_VIEWER_PORT = 3007
 DEFAULT_GAME_SERVER_PORT = 3000
 MINEFLAYER_PATTERN = "/root/ADAM-sparse/env/mineflayer/index.js"
+DEFAULT_GOAL_ITEMS = ["crafting_table"]
+DEFAULT_GOAL_ENVIRONMENT = ["grass"]
+QUIET_BOOT = os.environ.get("ADAM_QUIET_BOOT", "1") != "0"
+
+
+def boot_print(message):
+    if not QUIET_BOOT:
+        print(message)
 
 
 def load_llm_config(config_path="API_key.txt"):
@@ -119,7 +127,7 @@ def stop_stale_run_and_mineflayer_processes(server_ports):
                     should_stop = True
                     break
         if should_stop:
-            print(f"Stopping stale process PID {pid}: {args}")
+            boot_print(f"Stopping stale process PID {pid}: {args}")
             try:
                 os.kill(pid, signal.SIGTERM)
                 stale_pids.append(pid)
@@ -131,7 +139,7 @@ def stop_stale_run_and_mineflayer_processes(server_ports):
             os.kill(pid, 0)
         except OSError:
             continue
-        print(f"Force killing stale process PID {pid}")
+        boot_print(f"Force killing stale process PID {pid}")
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -199,14 +207,16 @@ def open_viewer_in_browser(viewer_url):
 
     if process_listing:
         for line in process_listing.splitlines():
-            if "firefox" not in line:
+            if "chrome" not in line and "chromium" not in line:
                 continue
             if "adam-gpu-viewer-profile" in line:
                 continue
-            print(f"Detected existing non-GPU Firefox instance; ignoring it for viewer launch: {line.strip()}")
+            boot_print(
+                f"Detected existing non-GPU Chrome/Chromium instance; ignoring it for viewer launch: {line.strip()}"
+            )
             break
 
-    stale_gpu_firefox = []
+    stale_gpu_chrome = []
     if process_listing:
         for line in process_listing.splitlines():
             fields = line.strip().split(None, 1)
@@ -216,34 +226,59 @@ def open_viewer_in_browser(viewer_url):
             args = fields[1]
             if "adam-gpu-viewer-profile" not in args:
                 continue
-            stale_gpu_firefox.append((pid, args))
+            if "chrome" not in args and "chromium" not in args:
+                continue
+            stale_gpu_chrome.append((pid, args))
 
-    if stale_gpu_firefox:
-        for pid, args in stale_gpu_firefox:
-            print(f"Stopping stale GPU Firefox viewer PID {pid}: {args}")
+    if stale_gpu_chrome:
+        for pid, args in stale_gpu_chrome:
+            boot_print(f"Stopping stale GPU Chrome viewer PID {pid}: {args}")
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 continue
         time.sleep(2)
-        for pid, args in stale_gpu_firefox:
+        for pid, args in stale_gpu_chrome:
             try:
                 os.kill(pid, 0)
             except OSError:
                 continue
-            print(f"Force killing stale GPU Firefox viewer PID {pid}")
+            boot_print(f"Force killing stale GPU Chrome viewer PID {pid}")
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 continue
 
     try:
+        chrome_log = open("/tmp/adam-chrome-viewer.log", "ab", buffering=0)
         subprocess.Popen(
-            ["/root/start-firefox-gpu.sh", viewer_url],
+            ["/root/start-chrome-gpu.sh", viewer_url],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=chrome_log,
+            stderr=chrome_log,
+            start_new_session=True,
         )
+        time.sleep(5)
+        try:
+            subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    "DISPLAY=${DISPLAY:-:1} "
+                    "wid=$(xdotool search --onlyvisible --name 'Prismarine Viewer - Google Chrome' | tail -1) "
+                    "&& [ -n \"$wid\" ] "
+                    "&& xdotool windowactivate --sync \"$wid\" "
+                    "&& xdotool windowmove \"$wid\" 320 27 "
+                    "&& xdotool windowsize \"$wid\" 960 1080",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -262,7 +297,7 @@ def print_gpu_process_status():
 
     interesting = []
     for line in output.splitlines():
-        if any(token in line for token in ("firefox", "minecraft-launcher", "java")):
+        if any(token in line for token in ("chrome", "chromium", "minecraft-launcher", "java")):
             interesting.append(line.strip())
 
     if interesting:
@@ -272,17 +307,30 @@ def print_gpu_process_status():
     else:
         print("GPU-attached graphics processes: none detected yet")
 
+
+def build_visual_image_dir(goal_items):
+    safe_goal = "-".join(goal_items) if goal_items else "unknown-task"
+    safe_goal = re.sub(r"[^A-Za-z0-9._-]+", "-", safe_goal).strip("-") or "unknown-task"
+    run_stamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join("Adam", f"game_image_{safe_goal}_{run_stamp}")
+
 llm_config = load_llm_config("API_key.txt")
 openai_api_key = llm_config["api_key"]
 if llm_config["base_url"]:
     os.environ["OPENAI_BASE_URL"] = llm_config["base_url"]
-    print(f"Using OPENAI_BASE_URL={llm_config['base_url']}")
-print(f"Using LLM model: {llm_config['model']}")
+    boot_print(f"Using OPENAI_BASE_URL={llm_config['base_url']}")
+boot_print(f"Using LLM model: {llm_config['model']}")
+
+goal_items = DEFAULT_GOAL_ITEMS
+goal_environment = DEFAULT_GOAL_ENVIRONMENT
 
 mc_port = detect_minecraft_lan_port()
-print(f"Using Minecraft LAN port: {mc_port}")
+boot_print(f"Using Minecraft LAN port: {mc_port}")
 viewer_port = int(os.environ.get("ADAM_VIEWER_PORT", DEFAULT_VIEWER_PORT))
 viewer_url = f"http://127.0.0.1:{viewer_port}"
+visual_image_dir = build_visual_image_dir(goal_items)
+os.environ["ADAM_VISUAL_IMAGE_DIR"] = visual_image_dir
+boot_print(f"Visual screenshot directory: {visual_image_dir}")
 max_parallel_envs = 2
 stop_stale_run_and_mineflayer_processes(
     [DEFAULT_GAME_SERVER_PORT + i for i in range(max_parallel_envs)]
@@ -297,6 +345,7 @@ ADAM = ADAM(
     game_visual_server_port=viewer_port,
     auto_load_ckpt=False,
     parallel=False,
+    infer_sampling_num=1,
 )
 
 print(f"Mineflayer viewer URL: {viewer_url}")
@@ -309,4 +358,4 @@ print_gpu_process_status()
 ADAM.run_visual_API()
 print("Visual screenshot capture enabled.")
 
-ADAM.explore(['iron_ingot'], ['grass'])
+ADAM.explore(goal_items, goal_environment)
