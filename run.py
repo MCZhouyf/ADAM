@@ -1,15 +1,21 @@
+import json
 import os
 import re
 import signal
+import socket
 import subprocess
+import threading
 import time
+import urllib.request
+
+import websocket
 
 from Adam.ADAM import ADAM
 
 DEFAULT_VIEWER_PORT = 3007
 DEFAULT_GAME_SERVER_PORT = 3000
 MINEFLAYER_PATTERN = "/root/ADAM-sparse/env/mineflayer/index.js"
-DEFAULT_GOAL_ITEMS = ["planks"]
+DEFAULT_GOAL_ITEMS = ["crafting_table"]
 DEFAULT_GOAL_ENVIRONMENT = ["grass"]
 QUIET_BOOT = os.environ.get("ADAM_QUIET_BOOT", "1") != "0"
 
@@ -119,7 +125,11 @@ def stop_stale_run_and_mineflayer_processes(server_ports):
         if pid == current_pid:
             continue
         should_stop = False
-        if "python3 run.py" in args or "python run.py" in args:
+        arg_parts = args.split()
+        executable = os.path.basename(arg_parts[0]) if arg_parts else ""
+        if executable.startswith("python") and any(
+            os.path.basename(part) == "run.py" for part in arg_parts[1:]
+        ):
             should_stop = True
         elif MINEFLAYER_PATTERN in args:
             for port in server_ports:
@@ -207,9 +217,14 @@ def open_viewer_in_browser(viewer_url):
 
     if process_listing:
         for line in process_listing.splitlines():
-            if "chrome" not in line and "chromium" not in line:
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or not fields[0].isdigit():
                 continue
-            if "adam-gpu-viewer-profile" in line:
+            args = fields[1]
+            executable = os.path.basename(args.split()[0]) if args.split() else ""
+            if "chrome" not in executable and "chromium" not in executable:
+                continue
+            if "adam-gpu-viewer-profile" in args:
                 continue
             boot_print(
                 f"Detected existing non-GPU Chrome/Chromium instance; ignoring it for viewer launch: {line.strip()}"
@@ -224,9 +239,10 @@ def open_viewer_in_browser(viewer_url):
                 continue
             pid = int(fields[0])
             args = fields[1]
+            executable = os.path.basename(args.split()[0]) if args.split() else ""
             if "adam-gpu-viewer-profile" not in args:
                 continue
-            if "chrome" not in args and "chromium" not in args:
+            if "chrome" not in executable and "chromium" not in executable:
                 continue
             stale_gpu_chrome.append((pid, args))
 
@@ -282,6 +298,120 @@ def open_viewer_in_browser(viewer_url):
         return True
     except Exception:
         return False
+
+
+def wait_for_tcp_port(host, port, timeout_seconds=180):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def call_chrome_devtools(websocket_url, method, params=None, origin="http://127.0.0.1:9222"):
+    ws = websocket.create_connection(websocket_url, timeout=10, origin=origin)
+    try:
+        ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        while True:
+            message = json.loads(ws.recv())
+            if message.get("id") != 1:
+                continue
+            if "error" in message:
+                raise RuntimeError(message["error"])
+            return message.get("result", {})
+    finally:
+        ws.close()
+
+
+def get_chrome_pages():
+    with urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def refresh_existing_viewer_tab(viewer_url):
+    pages = get_chrome_pages()
+    viewer_pages = [
+        page for page in pages
+        if page.get("type") == "page"
+        and page.get("webSocketDebuggerUrl")
+        and viewer_url in page.get("url", "")
+    ]
+    if not viewer_pages:
+        return False
+
+    viewer_pages.sort(key=lambda page: page.get("title") != "Prismarine Viewer")
+    active_page = viewer_pages[0]
+    call_chrome_devtools(
+        active_page["webSocketDebuggerUrl"],
+        "Page.navigate",
+        {"url": viewer_url},
+    )
+
+    for stale_page in viewer_pages[1:]:
+        try:
+            call_chrome_devtools(stale_page["webSocketDebuggerUrl"], "Page.close")
+        except Exception:
+            pass
+    return True
+
+
+def refresh_viewer_when_ready(viewer_url, viewer_port):
+    def _worker():
+        if not wait_for_tcp_port("127.0.0.1", viewer_port):
+            print(f"Viewer port {viewer_port} did not become ready; browser was not refreshed.")
+            return
+
+        display = detect_server_display()
+        env = os.environ.copy()
+        if display:
+            env["DISPLAY"] = display
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+
+        try:
+            refreshed_existing_tab = refresh_existing_viewer_tab(viewer_url)
+        except Exception:
+            refreshed_existing_tab = False
+
+        if not refreshed_existing_tab:
+            try:
+                chrome_log = open("/tmp/adam-chrome-viewer.log", "ab", buffering=0)
+                subprocess.Popen(
+                    ["/root/start-chrome-gpu.sh", viewer_url],
+                    env=env,
+                    stdout=chrome_log,
+                    stderr=chrome_log,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                print(f"Failed to refresh Mineflayer viewer after startup: {exc}")
+                return
+
+        try:
+            subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    "DISPLAY=${DISPLAY:-:1} "
+                    "wid=$(xdotool search --onlyvisible --name 'Prismarine Viewer - Google Chrome' | tail -1) "
+                    "&& [ -n \"$wid\" ] "
+                    "&& xdotool windowactivate --sync \"$wid\" "
+                    "&& xdotool key --clearmodifiers ctrl+r",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        print(f"Mineflayer viewer refreshed after port {viewer_port} became ready.")
+
+    threading.Thread(target=_worker, name="ADAMViewerRefresh", daemon=True).start()
 
 
 def print_gpu_process_status():
@@ -351,6 +481,7 @@ ADAM = ADAM(
 print(f"Mineflayer viewer URL: {viewer_url}")
 if open_viewer_in_browser(viewer_url):
     print("Opened Mineflayer viewer in browser.")
+    refresh_viewer_when_ready(viewer_url, viewer_port)
 else:
     print("Failed to auto-open browser. Open the viewer URL manually.")
 time.sleep(2)

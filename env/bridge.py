@@ -1,10 +1,13 @@
 import os.path
+import threading
 import time
 import warnings
 from typing import SupportsFloat, Any, Tuple, Dict
+import urllib.request
 
 import requests
 import json
+import websocket
 
 import gymnasium as gym
 from gymnasium.core import ObsType
@@ -48,6 +51,60 @@ class VoyagerEnv(gym.Env):
         self.reset_options = None
         self.connected = False
         self.server_paused = False
+        self.chrome_debug_url = os.environ.get(
+            "ADAM_CHROME_DEBUG_URL", "http://127.0.0.1:9222/json"
+        )
+
+    def refresh_visual_viewer(self):
+        if self.visual_server_port == -1:
+            return
+        if os.environ.get("ADAM_AUTO_REFRESH_VIEWER", "1") == "0":
+            return
+
+        def _worker():
+            time.sleep(float(os.environ.get("ADAM_VIEWER_RECONNECT_DELAY", "0.8")))
+            viewer_url = f"http://127.0.0.1:{self.visual_server_port}/"
+            try:
+                with urllib.request.urlopen(self.chrome_debug_url, timeout=3) as response:
+                    pages = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                return
+
+            viewer_pages = [
+                page for page in pages
+                if page.get("type") == "page"
+                and page.get("webSocketDebuggerUrl")
+                and viewer_url.rstrip("/") in page.get("url", "").rstrip("/")
+            ]
+            if not viewer_pages:
+                return
+
+            viewer_pages.sort(key=lambda page: page.get("title") != "Prismarine Viewer")
+            page = viewer_pages[0]
+            try:
+                ws = websocket.create_connection(
+                    page["webSocketDebuggerUrl"],
+                    timeout=5,
+                    origin="http://127.0.0.1:9222",
+                )
+                try:
+                    ws.send(json.dumps({
+                        "id": 1,
+                        "method": "Page.navigate",
+                        "params": {"url": viewer_url},
+                    }))
+                    deadline = time.time() + 5
+                    while time.time() < deadline:
+                        message = json.loads(ws.recv())
+                        if message.get("id") == 1:
+                            break
+                finally:
+                    ws.close()
+                print(f"Mineflayer viewer reconnected: {viewer_url}")
+            except Exception:
+                return
+
+        threading.Thread(target=_worker, name="ADAMViewerReconnect", daemon=True).start()
 
     def get_mineflayer_process(self, server_port):
         U.f_mkdir(self.log_path, "mineflayer")
@@ -91,17 +148,21 @@ class VoyagerEnv(gym.Env):
                 time.sleep(1)
                 continue
             print(self.mineflayer.ready_line)
-            res = requests.post(
-                f"{self.server}/start",
-                json=self.reset_options,
-                timeout=self.request_timeout,
+
+    def start_mineflayer_session(self):
+        self.check_process()
+        res = requests.post(
+            f"{self.server}/start",
+            json=self.reset_options,
+            timeout=self.request_timeout,
+        )
+        if res.status_code != 200:
+            self.mineflayer.stop()
+            raise RuntimeError(
+                f"Minecraft server reply with code {res.status_code}"
             )
-            if res.status_code != 200:
-                self.mineflayer.stop()
-                raise RuntimeError(
-                    f"Minecraft server reply with code {res.status_code}"
-                )
-            return res.json()
+        self.refresh_visual_viewer()
+        return res.json()
 
     def step(
             self,
@@ -152,10 +213,7 @@ class VoyagerEnv(gym.Env):
         }
 
         self.unpause()
-        self.mineflayer.stop()
-        time.sleep(1)  # wait for mineflayer to exit
-
-        returned_data = self.check_process()
+        returned_data = self.start_mineflayer_session()
         self.has_reset = True
         self.connected = True
         # All the reset in step will be soft
@@ -163,15 +221,16 @@ class VoyagerEnv(gym.Env):
         self.pause()
         return json.loads(returned_data)
 
-    def close(self):
+    def close(self, stop_process=True):
         self.unpause()
         if self.connected:
             res = requests.post(f"{self.server}/stop")
             if res.status_code == 200:
                 self.connected = False
-        if self.mc_instance:
+        if self.mc_instance and stop_process:
             self.mc_instance.stop()
-        self.mineflayer.stop()
+        if stop_process:
+            self.mineflayer.stop()
         return not self.connected
 
     def pause(self):

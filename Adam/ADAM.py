@@ -557,7 +557,7 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
                 with lock:
                     recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
                     self.update_material_dict(end_item)
-                env.close()
+                env.close(stop_process=False)
                 time.sleep(1)
                 return True
             if save_marker in {"wood_log_gathered:side_drop_only", "wood_log_gathered:no_progress"}:
@@ -566,7 +566,7 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
                     f"Final start_item={start_item}, end_item={end_item}, "
                     f"save_marker={save_marker}, added_items={added_items}"
                 )
-                env.close()
+                env.close(stop_process=False)
                 time.sleep(1)
                 return False
         if not added_items:
@@ -574,7 +574,7 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
                 f"Action {action} produced no added items from the current local world state. "
                 f"Final start_item={start_item}, end_item={end_item}, save_marker={save_marker}"
             )
-            env.close()
+            env.close(stop_process=False)
             time.sleep(1)
             return False
         if not has_expected_action_progress(action, added_items):
@@ -582,7 +582,7 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
                 f"Action {action} added items {added_items}, but none match the expected progress type. "
                 f"Final start_item={start_item}, end_item={end_item}, save_marker={save_marker}"
             )
-            env.close()
+            env.close(stop_process=False)
             time.sleep(1)
             return False
         print(
@@ -592,7 +592,7 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
         with lock:
             recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
             self.update_material_dict(end_item)
-        env.close()
+        env.close(stop_process=False)
         time.sleep(1)
         return True
 
@@ -635,21 +635,32 @@ Example format: {{gatherWoodLog, craftPlanks, craftCraftingTable}}
             time.sleep(1)
             start_item = get_latest_inventory(reset_result)
             print(f"Verification start_item={start_item}")
-            env.step(skill_loader(action))
+            action_step_failed = False
+            try:
+                env.step(skill_loader(action))
+            except Exception as step_error:
+                action_step_failed = True
+                print(f"Verification action failed as expected for this condition: {step_error}")
             time.sleep(1)
-            result = env.step('')
+            try:
+                result = env.step('')
+            except Exception as observe_error:
+                if not action_step_failed:
+                    raise
+                print(f"Verification observation after failed action also failed: {observe_error}")
+                result = reset_result
             time.sleep(1)
             end_item = get_latest_inventory(result, start_item)
             consumed_items, added_items = get_item_changes(start_item, end_item)
-            verification_success = check_in_material(added_items, effect_item)
+            verification_success = (not action_step_failed) and check_in_material(added_items, effect_item)
             if action == "gatherStone" and effect_item in {"M", "cobblestone"}:
-                verification_success = "cobblestone" in added_items
+                verification_success = (not action_step_failed) and "cobblestone" in added_items
             print(f"Verification end_item={end_item}")
             print(f"Verification added_items={added_items}")
             print(f"Verification success={verification_success}")
             with lock:
                 recorder(start_item, end_item, consumed_items, added_items, action, self.dataset_path)
-            env.close()
+            env.close(stop_process=False)
             time.sleep(1)
             return verification_success
         except Exception as e:

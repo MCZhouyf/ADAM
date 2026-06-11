@@ -22,6 +22,7 @@ let bot = null;
 let viewerStatus = "disabled";
 let viewerHost = "127.0.0.1";
 const VIEWER_DISTANCE = Number(process.env.ADAM_VIEWER_DISTANCE || 5);
+const VIEWER_UPDATE_INTERVAL = Number(process.env.ADAM_VIEWER_UPDATE_INTERVAL || 50);
 
 function isAirLike(block) {
     return !block || block.name === "air" || block.name === "cave_air" || block.name === "void_air";
@@ -129,6 +130,23 @@ function getTrackedPlayerSpawnPosition(playerEntity) {
     };
 }
 
+function markViewerAction(botInstance, actionName) {
+    if (!botInstance || !botInstance.viewer || !botInstance.entity) return;
+    const pos = botInstance.entity.position.floored();
+    const markerId = "adam_current_action";
+    botInstance.viewer.drawBoxGrid(
+        markerId,
+        {x: pos.x - 1, y: pos.y, z: pos.z - 1},
+        {x: pos.x + 2, y: pos.y + 2, z: pos.z + 2},
+        actionName && actionName.startsWith("craft") ? "yellow" : "lime"
+    );
+    setTimeout(() => {
+        if (botInstance.viewer) {
+            botInstance.viewer.erase(markerId);
+        }
+    }, 2000);
+}
+
 const app = express();
 
 app.use(bodyParser.json({limit: "50mb"}));
@@ -179,12 +197,13 @@ app.post("/start", (req, res) => {
         if (VISUAL_SERVER_PORT !== "-1") {
             try {
                 console.log("Initializing Mineflayer viewer...");
-                const mineflayerViewer = require('prismarine-viewer').mineflayer
+                const mineflayerViewer = require('./lib/adamViewer')
                 mineflayerViewer(bot, {
                     firstPerson: false,
                     viewDistance: VIEWER_DISTANCE,
                     port: Number(VISUAL_SERVER_PORT),
                     host: "0.0.0.0",
+                    updateInterval: VIEWER_UPDATE_INTERVAL,
                 });
                 console.log("Mineflayer viewer initialized.");
                 viewerHost = req.hostname || "127.0.0.1";
@@ -316,6 +335,10 @@ app.post("/start", (req, res) => {
     }
 
     function onDisconnect(message) {
+        if (!bot) {
+            console.log(message);
+            return;
+        }
         if (bot.viewer) {
             bot.viewer.close();
         }
@@ -415,6 +438,7 @@ app.post("/step", async (req, res) => {
     const actionName = actionMatch ? actionMatch[1] : "unknown";
     console.log(`ADAM_STEP_START action=${actionName} codeChars=${code.length} programsChars=${programs.length}`);
     bot.chat(`[ADAM_STEP_START] ${actionName}`);
+    markViewerAction(bot, actionName);
     if (actionName.startsWith("craft")) {
         const playerEntity = getNearestHumanPlayerEntity(bot);
         const safeTrackedPosition = playerEntity ? findSafeTrackedPosition(bot, playerEntity, 8) : null;
@@ -605,7 +629,14 @@ app.post("/step", async (req, res) => {
 });
 
 app.post("/stop", (req, res) => {
-    bot.end();
+    if (bot && bot.viewer) {
+        bot.viewer.close();
+    }
+    if (bot) {
+        bot.end();
+    }
+    bot = null;
+    viewerStatus = "disabled";
     res.json({
         message: "Bot stopped",
     });

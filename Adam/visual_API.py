@@ -1,8 +1,13 @@
+import base64
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
+
+import websocket
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -19,6 +24,7 @@ class VisualAPI:
         self.display = os.environ.get("DISPLAY", ":1")
         self.capture_tool = self.detect_capture_tool()
         self.capture_index = self.detect_next_capture_index()
+        self.chrome_debug_url = os.environ.get("ADAM_CHROME_DEBUG_URL", "http://127.0.0.1:9222/json")
 
     def detect_capture_tool(self):
         for tool in ("import", "xwd"):
@@ -75,6 +81,61 @@ class VisualAPI:
                 stderr=subprocess.DEVNULL,
             )
 
+    def find_viewer_devtools_page(self):
+        with urllib.request.urlopen(self.chrome_debug_url, timeout=5) as response:
+            pages = json.loads(response.read().decode("utf-8"))
+        viewer_pages = [
+            page for page in pages
+            if page.get("type") == "page"
+            and page.get("webSocketDebuggerUrl")
+            and self.viewer_url in page.get("url", "")
+        ]
+        if not viewer_pages:
+            raise RuntimeError(f"Could not find Chrome DevTools page for {self.viewer_url}")
+        viewer_pages.sort(key=lambda page: page.get("title") != "Prismarine Viewer")
+        return viewer_pages[0]
+
+    def capture_devtools_page(self, screenshot_path):
+        page = self.find_viewer_devtools_page()
+        ws = websocket.create_connection(
+            page["webSocketDebuggerUrl"],
+            timeout=10,
+            origin="http://127.0.0.1:9222",
+        )
+        message_id = 0
+
+        def send(method, params=None):
+            nonlocal message_id
+            message_id += 1
+            ws.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+            while True:
+                message = json.loads(ws.recv())
+                if message.get("id") != message_id:
+                    continue
+                if "error" in message:
+                    raise RuntimeError(message["error"])
+                return message.get("result", {})
+
+        try:
+            send("Page.enable")
+            send(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": int(os.environ.get("ADAM_VISUAL_CAPTURE_WIDTH", "1280")),
+                    "height": int(os.environ.get("ADAM_VISUAL_CAPTURE_HEIGHT", "720")),
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                },
+            )
+            result = send("Page.captureScreenshot", {"format": "png", "fromSurface": True})
+            image_data = result.get("data")
+            if not image_data:
+                raise RuntimeError("Chrome DevTools returned an empty screenshot")
+            with open(screenshot_path, "wb") as image_file:
+                image_file.write(base64.b64decode(image_data))
+        finally:
+            ws.close()
+
     def detect_next_capture_index(self):
         if not os.path.isdir(self.image_dir):
             return 1
@@ -99,12 +160,16 @@ class VisualAPI:
         print("Visual API Ready", flush=True)
         while True:
             try:
-                window_id = self.find_viewer_window_id()
                 date_prefix = time.strftime("%Y%m%d")
                 sequence_name = f"{date_prefix}_{self.capture_index:04d}.png"
                 sequence_path = os.path.join(self.image_dir, sequence_name)
                 latest_path = os.path.join(self.image_dir, "tmp.png")
-                self.capture_window(window_id, sequence_path)
+                try:
+                    self.capture_devtools_page(sequence_path)
+                except Exception as devtools_error:
+                    window_id = self.find_viewer_window_id()
+                    self.capture_window(window_id, sequence_path)
+                    print(f"DevTools screenshot failed, used X11 fallback: {devtools_error}", flush=True)
                 shutil.copyfile(sequence_path, latest_path)
                 self.capture_index += 1
             except Exception as error:
